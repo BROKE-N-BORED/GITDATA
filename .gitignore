@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.zip
+.forge/
+config.json
+sources.json
+mylist.json
+logs/

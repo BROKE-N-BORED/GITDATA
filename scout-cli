@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Dataset Scout command line — run with: bash scout-cli <command>
+#   bash scout-cli search "reasoning dataset"
+#   bash scout-cli sources list
+#   bash scout-cli list
+#   bash scout-cli export stella stella-manifest.json
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks (the `scout` command is a symlink into this folder).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+cd "$DIR"
+
+if [ -x "$DIR/.venv/bin/python" ]; then
+  PY="$DIR/.venv/bin/python"
+else
+  PY="python3"
+fi
+
+exec "$PY" -m scout.cli "$@"

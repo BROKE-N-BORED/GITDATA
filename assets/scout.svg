@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Dataset Scout icon: a magnifier over a star, with sparkles. -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#1b2a4a"/>
+  <circle cx="112" cy="112" r="62" fill="none" stroke="#ffd166" stroke-width="16"/>
+  <line x1="160" y1="160" x2="208" y2="208" stroke="#ffd166" stroke-width="20" stroke-linecap="round"/>
+  <path d="M112 78 L121 102 L146 112 L121 122 L112 146 L103 122 L78 112 L103 102 Z" fill="#7ee0ff"/>
+  <path d="M196 40 L200 52 L212 56 L200 60 L196 72 L192 60 L180 56 L192 52 Z" fill="#ffffff"/>
+  <path d="M52 168 L55 178 L65 181 L55 184 L52 194 L49 184 L39 181 L49 178 Z" fill="#ffffff"/>
+</svg>
