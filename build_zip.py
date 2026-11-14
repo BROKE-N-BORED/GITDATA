@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ZIP_NAME = "dataset-scout-v0.1.1.zip"
+ZIP_NAME = "dataset-scout-v0.1.2.zip"
 
 SCRIPTS = {"install.sh", "run.sh", "scout-cli", "run_tests.sh", "build_zip.py"}
 

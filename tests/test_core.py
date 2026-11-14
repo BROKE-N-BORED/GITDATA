@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import sys
@@ -190,31 +190,43 @@ class HfParseTests(unittest.TestCase):
 class SourcesTests(TempHomeMixin, unittest.TestCase):
     def test_defaults_on_first_run(self):
         sites = core.load_sources()
-        self.assertEqual(len(sites), 3)
+        self.assertEqual(len(sites), 2)
         names = [s["name"] for s in sites]
         self.assertIn("Hugging Face Datasets", names)
         self.assertIn("Kaggle Datasets", names)
-        self.assertIn("Papers With Code", names)
+
+    def test_dead_papers_with_code_entry_is_dropped(self):
+        # T31: Papers With Code is gone entirely (site + API both
+        # redirect to Hugging Face), so a saved entry for it is a
+        # dead button and is dropped on load.
+        core.save_sources([
+            {"name": "Hugging Face Datasets",
+             "url": "https://huggingface.co/datasets?search={q}"},
+            {"name": "Papers With Code",
+             "url": "https://paperswithcode.com/search?q={q}"},
+        ])
+        names = [s["name"] for s in core.load_sources()]
+        self.assertEqual(names, ["Hugging Face Datasets"])
 
     def test_add_remove_persist(self):
         sites = core.load_sources()
         sites.append({"name": "Example", "url": "https://example.com/?q={q}"})
         core.save_sources(sites)
-        self.assertEqual(len(core.load_sources()), 4)
+        self.assertEqual(len(core.load_sources()), 3)
         kept = [s for s in core.load_sources() if s["name"] != "Example"]
         core.save_sources(kept)
-        self.assertEqual(len(core.load_sources()), 3)
+        self.assertEqual(len(core.load_sources()), 2)
 
     def test_restore_defaults(self):
         core.save_sources([{"name": "Only", "url": "https://only.example/"}])
         restored = core.restore_default_sources()
-        self.assertEqual(len(restored), 3)
-        self.assertEqual(len(core.load_sources()), 3)
+        self.assertEqual(len(restored), 2)
+        self.assertEqual(len(core.load_sources()), 2)
 
     def test_corrupt_file_falls_back_to_defaults(self):
         core.sources_path().parent.mkdir(parents=True, exist_ok=True)
         core.sources_path().write_text("not json", encoding="utf-8")
-        self.assertEqual(len(core.load_sources()), 3)
+        self.assertEqual(len(core.load_sources()), 2)
 
     def test_build_site_url_fills_query(self):
         url = core.build_site_url(
@@ -282,6 +294,25 @@ class ExportTests(TempHomeMixin, unittest.TestCase):
         self.assertIn("[Data B](https://huggingface.co/datasets/x/y)", text)
         self.assertIn("10 stars", text)
         self.assertIn("Note: good one", text)
+
+    def test_markdown_keeps_unknown_categories(self):
+        # Categories are data, not a hardcoded list: an item whose
+        # category is not one of the five search presets still gets
+        # its own section, never dropped.
+        items = self._items() + [
+            {"title": "Odd One", "url": "https://example.com/odd",
+             "category": "my-own-thing", "source": "Found by hand",
+             "stars": 0, "updated": "", "license": "", "notes": ""},
+        ]
+        text = core.export_markdown(items)
+        self.assertIn("## My Own Thing", text)
+        self.assertIn("[Odd One](https://example.com/odd)", text)
+
+    def test_category_label(self):
+        self.assertEqual(core.category_label("reasoning"), "Reasoning")
+        self.assertEqual(core.category_label("my-own-thing"),
+                         "My Own Thing")
+        self.assertEqual(core.category_label(""), "All")
 
     def test_every_export_carries_the_stella_note(self):
         for text in (core.export_markdown(self._items()),
@@ -354,6 +385,310 @@ class TokenScrubTests(TempHomeMixin, unittest.TestCase):
         lines = core.ring_lines()
         self.assertTrue(any("something failed" in line for line in lines))
         self.assertTrue(any("ValueError: boom" in line for line in lines))
+
+
+class BadDataTests(TempHomeMixin, unittest.TestCase):
+    """T1: bad numbers and bad rows never crash the app."""
+
+    def test_bad_stars_becomes_zero(self):
+        item = core.normalize_item({"title": "x", "url": "https://e.com",
+                                    "stars": "five"})
+        self.assertEqual(item["stars"], 0)
+
+    def test_bad_downloads_becomes_zero(self):
+        item = core.normalize_item({"title": "x", "url": "https://e.com",
+                                    "downloads": "lots"})
+        self.assertEqual(item["downloads"], 0)
+
+    def test_safe_int_handles_none_and_words(self):
+        self.assertEqual(core._safe_int(None), 0)
+        self.assertEqual(core._safe_int("12"), 12)
+        self.assertEqual(core._safe_int(3.9), 3)
+
+    def test_bad_rows_are_skipped_and_the_list_still_loads(self):
+        raw = {"items": [
+            {"title": "Good", "url": "https://example.com/good",
+             "stars": "five"},
+            "not a dict at all",
+            {"title": "No URL here"},
+            {"title": "Also good", "url": "https://example.com/good2"},
+        ]}
+        core.list_path().parent.mkdir(parents=True, exist_ok=True)
+        core.list_path().write_text(json.dumps(raw), encoding="utf-8")
+        items = core.load_list()
+        self.assertEqual([item["title"] for item in items],
+                         ["Good", "Also good"])
+        self.assertEqual(items[0]["stars"], 0)
+
+    def test_corrupt_list_file_loads_empty(self):
+        core.list_path().parent.mkdir(parents=True, exist_ok=True)
+        core.list_path().write_text("{not json", encoding="utf-8")
+        self.assertEqual(core.load_list(), [])
+
+
+class AtomicSaveTests(TempHomeMixin, unittest.TestCase):
+    """T2: saves are atomic and keep a backup."""
+
+    def test_second_save_keeps_a_backup(self):
+        first = [{"title": "One", "url": "https://example.com/1"}]
+        second = [{"title": "Two", "url": "https://example.com/2"}]
+        core.save_list(first)
+        core.save_list(second)
+        self.assertEqual(core.load_list()[0]["title"], "Two")
+        bak = core.list_path().with_name("mylist.json.bak")
+        self.assertTrue(bak.is_file())
+        data = json.loads(bak.read_text(encoding="utf-8"))
+        titles = [item["title"]
+                  for col in data["collections"] for item in col["items"]]
+        self.assertEqual(titles, ["One"])
+
+    def test_no_tmp_file_left_behind(self):
+        core.save_list([{"title": "One", "url": "https://example.com/1"}])
+        self.assertEqual(list(core.home_dir().glob("*.tmp")), [])
+
+
+class NormalizeUrlTests(unittest.TestCase):
+    """T7: the same link in different shapes is one link."""
+
+    def test_trailing_slash_dropped(self):
+        self.assertEqual(
+            core.normalize_url("https://example.com/a/"),
+            "https://example.com/a")
+
+    def test_www_dropped_and_host_lowercased(self):
+        self.assertEqual(
+            core.normalize_url("https://WWW.Example.com/a"),
+            "https://example.com/a")
+
+    def test_default_port_dropped(self):
+        self.assertEqual(
+            core.normalize_url("https://example.com:443/a"),
+            "https://example.com/a")
+
+    def test_fragment_dropped(self):
+        self.assertEqual(
+            core.normalize_url("https://example.com/a#section"),
+            "https://example.com/a")
+
+    def test_query_kept(self):
+        self.assertEqual(
+            core.normalize_url("https://example.com/a?x=1"),
+            "https://example.com/a?x=1")
+
+    def test_add_to_list_dedups_by_normalised_url(self):
+        items, added = core.add_to_list(
+            [], {"title": "A", "url": "https://example.com/a"})
+        self.assertTrue(added)
+        items, added = core.add_to_list(
+            items, {"title": "A again",
+                    "url": "https://www.example.com/a/"})
+        self.assertFalse(added)
+        self.assertEqual(len(items), 1)
+
+    def test_remove_from_list_matches_normalised_url(self):
+        items = [{"title": "A", "url": "https://example.com/a/"}]
+        self.assertEqual(
+            core.remove_from_list(items, "https://www.example.com/a"),
+            [])
+
+
+class LogCleanupTests(TempHomeMixin, unittest.TestCase):
+    """T8: logs older than a week are deleted on startup."""
+
+    def test_old_log_deleted_recent_log_kept(self):
+        logs = core.home_dir() / "logs"
+        logs.mkdir(parents=True)
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        old = datetime.now(timezone.utc) - timedelta(days=9)
+        old_name = old.strftime("%Y%m%d")
+        (logs / f"scout-{today}.log").write_text("new", encoding="utf-8")
+        (logs / f"scout-{old_name}.log").write_text("old", encoding="utf-8")
+        core._LOG_CLEANUP_DONE = False
+        core._cleanup_old_logs()
+        self.assertFalse((logs / f"scout-{old_name}.log").exists())
+        self.assertTrue((logs / f"scout-{today}.log").exists())
+
+    def test_cleanup_runs_once_per_process(self):
+        core._LOG_CLEANUP_DONE = False
+        core._cleanup_old_logs()
+        self.assertTrue(core._LOG_CLEANUP_DONE)
+        core._cleanup_old_logs()  # second call is a no-op, not an error
+        self.assertTrue(core._LOG_CLEANUP_DONE)
+
+
+class ImportTests(unittest.TestCase):
+    """T13: exports read back in."""
+
+    def _items(self):
+        return [core.normalize_item(
+            {"title": "Alpha", "url": "https://example.com/a",
+             "category": "reasoning", "source": "GitHub",
+             "stars": 5, "notes": "good one"}),
+            core.normalize_item(
+            {"title": "Beta", "url": "https://example.com/b",
+             "category": "training", "source": "Hugging Face",
+             "stars": 0})]
+
+    def test_markdown_round_trip(self):
+        text = core.export_markdown(self._items())
+        back = core.import_file_text(text)
+        self.assertEqual([item["url"] for item in back],
+                         ["https://example.com/a",
+                          "https://example.com/b"])
+        self.assertEqual(back[0]["category"], "reasoning")
+        self.assertEqual(back[0]["notes"], "good one")
+        self.assertEqual(back[1]["category"], "training")
+
+    def test_json_round_trip(self):
+        text = core.export_json(self._items())
+        back = core.import_file_text(text)
+        self.assertEqual(len(back), 2)
+        self.assertEqual(back[0]["title"], "Alpha")
+
+    def test_stella_manifest_round_trip(self):
+        text = core.export_stella_manifest(self._items())
+        back = core.import_file_text(text)
+        self.assertEqual(len(back), 2)
+        self.assertEqual(back[1]["url"], "https://example.com/b")
+
+    def test_empty_file_is_a_plain_error(self):
+        with self.assertRaises(ValueError):
+            core.import_file_text("nothing here at all")
+
+    def test_bad_json_is_a_plain_error(self):
+        with self.assertRaises(ValueError):
+            core.import_file_text('{"items": nope}')
+
+
+class SearchCacheTests(TempHomeMixin, unittest.TestCase):
+    """T14: search cache + history."""
+
+    def test_cache_round_trip(self):
+        results = [{"title": "A", "url": "https://example.com/a"}]
+        core.save_search_cache("math", "reasoning", results)
+        self.assertEqual(
+            core.load_search_cache("math", "reasoning"), results)
+
+    def test_cache_miss_on_different_query(self):
+        core.save_search_cache("math", "reasoning", [])
+        self.assertIsNone(core.load_search_cache("other", "reasoning"))
+
+    def test_expired_cache_returns_none(self):
+        core.save_search_cache("math", "reasoning", [])
+        path = core.home_dir() / "cache.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for entry in data["entries"].values():
+            entry["saved"] = "2020-01-01T00:00:00+00:00"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(core.load_search_cache("math", "reasoning"))
+
+    def test_history_dedups_and_caps(self):
+        core.save_history("math", "reasoning")
+        core.save_history("code", "all")
+        core.save_history("math", "reasoning")
+        history = core.load_history()
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["query"], "math")
+        for n in range(12):
+            core.save_history(f"q{n}", "all")
+        self.assertEqual(len(core.load_history()), 10)
+        self.assertEqual(core.load_history()[0]["query"], "q11")
+
+    def test_empty_history_query_is_ignored(self):
+        core.save_history("   ", "all")
+        self.assertEqual(core.load_history(), [])
+
+
+class CollectionsTests(TempHomeMixin, unittest.TestCase):
+    """T30: named collections, with old lists migrating."""
+
+    def test_old_format_migrates_to_my_list(self):
+        raw = {"items": [{"title": "A",
+                          "url": "https://example.com/a"}]}
+        core.list_path().parent.mkdir(parents=True, exist_ok=True)
+        core.list_path().write_text(json.dumps(raw), encoding="utf-8")
+        active, names = core.load_collections()
+        self.assertEqual(active, "My List")
+        self.assertEqual(names, ["My List"])
+        self.assertEqual(len(core.load_list()), 1)
+
+    def test_collections_save_and_switch(self):
+        first = [{"title": "A", "url": "https://example.com/a"}]
+        second = [{"title": "B", "url": "https://example.com/b"}]
+        core.save_collections("One", [
+            {"name": "One", "items": first},
+            {"name": "Two", "items": second},
+        ])
+        self.assertEqual(core.load_list()[0]["title"], "A")
+        core.save_collections("Two", [
+            {"name": "One", "items": first},
+            {"name": "Two", "items": second},
+        ])
+        self.assertEqual(core.load_list()[0]["title"], "B")
+
+    def test_save_list_keeps_other_collections(self):
+        core.save_collections("One", [
+            {"name": "One", "items": []},
+            {"name": "Two", "items": [
+                {"title": "B", "url": "https://example.com/b"}]},
+        ])
+        core.save_list([{"title": "A", "url": "https://example.com/a"}])
+        _active, names = core.load_collections()
+        self.assertEqual(names, ["One", "Two"])
+        data = core.load_list_data()
+        two = [col for col in data["collections"]
+               if col["name"] == "Two"][0]
+        self.assertEqual(len(two["items"]), 1)
+
+
+class LicenseFilterTests(unittest.TestCase):
+    """T32: the license filter keeps exact matches only."""
+
+    def _results(self):
+        return [
+            {"title": "A", "license": "Apache-2.0", "stars": 0,
+             "updated": ""},
+            {"title": "B", "license": "MIT", "stars": 0, "updated": ""},
+            {"title": "C", "license": "", "stars": 0, "updated": ""},
+        ]
+
+    def test_no_filter_keeps_everything(self):
+        kept = core.filter_results(self._results(), False, None, 0)
+        self.assertEqual(len(kept), 3)
+
+    def test_filter_keeps_exact_match_case_insensitive(self):
+        kept = core.filter_results(self._results(), False, None, 0,
+                                   license_filter="apache-2.0")
+        self.assertEqual([item["title"] for item in kept], ["A"])
+
+    def test_filter_hides_unknown_licenses(self):
+        kept = core.filter_results(self._results(), False, None, 0,
+                                   license_filter="MIT")
+        self.assertEqual([item["title"] for item in kept], ["B"])
+
+
+class HelpersTests(unittest.TestCase):
+    def test_category_key_for_label(self):
+        self.assertEqual(core.category_key_for_label("Reasoning"),
+                         "reasoning")
+        self.assertEqual(core.category_key_for_label("reasoning"),
+                         "reasoning")
+        self.assertEqual(core.category_key_for_label("My Custom Stuff"),
+                         "my-custom-stuff")
+        self.assertEqual(core.category_key_for_label(""), "all")
+
+    def test_parse_version(self):
+        self.assertEqual(core.parse_version("v0.1.2"), (0, 1, 2))
+        self.assertEqual(core.parse_version("1.0"), (1, 0))
+        self.assertEqual(core.parse_version("garbage"), (0,))
+        self.assertLess(core.parse_version("v0.1.1"),
+                        core.parse_version("v0.1.2"))
+
+    def test_format_size(self):
+        self.assertEqual(core.format_size(500), "500 bytes")
+        self.assertEqual(core.format_size(2048), "2.0 KB")
+        self.assertEqual(core.format_size(3 * 1024 * 1024), "3.0 MB")
+        self.assertEqual(core.format_size("nope"), "")
 
 
 if __name__ == "__main__":

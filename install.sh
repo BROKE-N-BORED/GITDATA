@@ -33,8 +33,27 @@ if [ ! -x "$DIR/.venv/bin/python" ]; then
   fi
 fi
 
-"$DIR/.venv/bin/python" -m pip install --quiet --upgrade pip
-"$DIR/.venv/bin/python" -m pip install --quiet PySide6-Essentials PySide6-Addons
+echo "Setting up Dataset Scout's Python tools..."
+"$DIR/.venv/bin/python" -m pip install --upgrade pip
+
+# T34: retry the big download up to 3 times, showing progress.
+# A failed try leaves its partial download in pip's cache, so the
+# next try picks up where the last one got to instead of starting
+# over from scratch.
+echo "Downloading the interface toolkit (one-time, about 100 MB)..."
+tries=0
+until "$DIR/.venv/bin/python" -m pip install PySide6-Essentials PySide6-Addons; do
+  tries=$((tries + 1))
+  if [ "$tries" -ge 3 ]; then
+    echo "ERROR: the download failed 3 times. Check the network and" >&2
+    echo "run bash install.sh again; the next try resumes from the" >&2
+    echo "cache instead of starting over." >&2
+    exit 1
+  fi
+  echo "Download interrupted, trying again ($tries of 3)..."
+  sleep 2
+done
+echo "Toolkit downloaded."
 
 # Fatal check: the GUI toolkit must import, or the install has failed.
 if ! "$DIR/.venv/bin/python" -c "import PySide6; from PySide6 import QtWidgets" 2>/dev/null; then

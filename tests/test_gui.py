@@ -14,16 +14,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QGroupBox, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QStatusBar, QTextEdit, QWidget,
+    QApplication, QCheckBox, QDialog, QGroupBox, QInputDialog, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPushButton, QStatusBar,
+    QTextEdit, QWidget,
 )
 from PySide6.QtTest import QTest
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QModelIndex, QSettings, Qt
 
 from scout import apis, core
 from scout.gui import (
-    HOW_TO_USE_SECTIONS, SETTINGS_APP, SETTINGS_ORG, MainWindow,
-    SingleInstance,
+    HOW_TO_USE_SECTIONS, R_STARS, SETTINGS_APP, SETTINGS_ORG,
+    SHORTCUTS, EditItemDialog, MainWindow, SingleInstance,
 )
 
 APP = None
@@ -199,23 +200,23 @@ class FoundLinkTests(GuiTestCase):
 
 class SourcesTabTests(GuiTestCase):
     def test_sources_table_lists_defaults(self):
-        self.assertEqual(self.window.sources_table.rowCount(), 3)
+        self.assertEqual(self.window.sources_table.rowCount(), 2)
 
     def test_add_and_remove_source_round_trip(self):
         self.window.site_name.setText("Example Site")
         self.window.site_url.setText("https://example.com/?q={q}")
         self.window.add_source()
-        self.assertEqual(self.window.sources_table.rowCount(), 4)
-        self.assertEqual(len(core.load_sources()), 4)
-        self.window.remove_source("Example Site")
         self.assertEqual(self.window.sources_table.rowCount(), 3)
         self.assertEqual(len(core.load_sources()), 3)
+        self.window.remove_source("Example Site")
+        self.assertEqual(self.window.sources_table.rowCount(), 2)
+        self.assertEqual(len(core.load_sources()), 2)
 
     def test_restore_defaults(self):
         self.window.remove_source("Kaggle Datasets")
-        self.assertEqual(self.window.sources_table.rowCount(), 2)
+        self.assertEqual(self.window.sources_table.rowCount(), 1)
         self.window.restore_sources()
-        self.assertEqual(self.window.sources_table.rowCount(), 3)
+        self.assertEqual(self.window.sources_table.rowCount(), 2)
 
     def test_refresh_never_doubles_the_remove_buttons(self):
         # Regression: _refresh_sources_table used to leave the old
@@ -234,8 +235,8 @@ class SourcesTabTests(GuiTestCase):
             b for b in self.window.sources_table.findChildren(QPushButton)
             if b.text() == "Remove"
         ]
-        self.assertEqual(len(buttons), 3)
-        for row in range(3):
+        self.assertEqual(len(buttons), 2)
+        for row in range(2):
             self.assertIn(
                 self.window.sources_table.cellWidget(row, 2), buttons
             )
@@ -260,7 +261,10 @@ class ListTabTests(GuiTestCase):
 
     def test_remove_selected(self):
         self.window.list_table.selectRow(0)
-        self.window.remove_selected()
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.window.remove_selected()
         self.assertEqual(len(self.window.my_list), 0)
         self.assertEqual(core.load_list(), [])
 
@@ -328,8 +332,10 @@ class HowToUseTests(GuiTestCase):
         self.assertNotIn("&", text)
 
     def test_how_to_use_opens_from_the_help_menu(self):
-        help_menu = self.window.menuBar().actions()[0].menu()
-        self.assertEqual(help_menu.title(), "Help")
+        menus = {a.text(): a.menu()
+                 for a in self.window.menuBar().actions()}
+        self.assertIn("Help", menus)
+        help_menu = menus["Help"]
         actions = {a.text(): a for a in help_menu.actions()}
         self.assertIn("How to Use", actions)
         actions["How to Use"].trigger()
@@ -513,7 +519,7 @@ class LinkCheckStopTests(GuiTestCase):
             "url": f"https://example.com/{n}",
             "category": "reasoning", "source": "GitHub",
             "stars": 5, "updated": "", "license": "", "notes": ""})
-            for n in range(4)]
+            for n in range(8)]
         core.save_list(self.window.my_list)
         self.window._refresh_list_tab()
 
@@ -557,7 +563,7 @@ class LinkCheckStopTests(GuiTestCase):
             count = self.window._check_done_count
             self.assertEqual(
                 self.window.statusBar().currentMessage(),
-                f"Checking {count} of 4...")
+                f"Checking {count} of 8...")
             self.window.stop_link_check()
             self._wait_for_check_button()
 
@@ -578,13 +584,13 @@ class LinkCheckStopTests(GuiTestCase):
             self._wait_for_check_button()
         checked = self.window._check_done_count
         self.assertGreaterEqual(checked, 1)
-        self.assertLess(checked, 4)
+        self.assertLess(checked, 8)
         self.assertEqual(
             self.window.statusBar().currentMessage(),
-            f"Stopped, {checked} of 4 checked.")
+            f"Stopped, {checked} of 8 checked.")
         statuses = [item["status"] for item in self.window.my_list]
         self.assertEqual(statuses.count("ok"), checked)
-        self.assertEqual(statuses.count(""), 4 - checked)
+        self.assertEqual(statuses.count(""), 8 - checked)
         self.assertNotIn("checking", statuses)
 
 
@@ -657,6 +663,357 @@ class PartialSearchTests(GuiTestCase):
         self.assertIn("GitHub", message)
         self.assertIn("Hugging Face", message)
         self.assertEqual(self.window.results_table.rowCount(), 0)
+
+
+class MenusTests(GuiTestCase):
+    """T23: real menus, not just Help."""
+
+    def _menus(self):
+        return {action.text(): action.menu()
+                for action in self.window.menuBar().actions()}
+
+    def test_four_menus_exist(self):
+        self.assertEqual(set(self._menus()),
+                         {"File", "Edit", "View", "Help"})
+
+    def test_file_menu_has_export_import_send_exit(self):
+        actions = {a.text()
+                   for a in self._menus()["File"].actions()}
+        self.assertIn("Export as Markdown list", actions)
+        self.assertIn("Export as JSON", actions)
+        self.assertIn("Export STELLA manifest", actions)
+        self.assertIn("Import a list", actions)
+        self.assertIn("Send to STELLA", actions)
+        self.assertIn("Exit", actions)
+
+    def test_edit_menu_has_undo_remove_clear(self):
+        actions = {a.text()
+                   for a in self._menus()["Edit"].actions()}
+        self.assertIn("Undo remove", actions)
+        self.assertIn("Remove selected", actions)
+        self.assertIn("Clear My List", actions)
+
+    def test_view_menu_jumps_to_tabs(self):
+        actions = {a.text(): a
+                   for a in self._menus()["View"].actions()}
+        actions["My List tab"].trigger()
+        self.assertEqual(
+            self.window.tabs.currentIndex(),
+            self.window.list_tab_index)
+        actions["Search tab"].trigger()
+        self.assertEqual(self.window.tabs.currentIndex(), 0)
+
+    def test_help_menu_has_updates_and_about(self):
+        actions = {a.text()
+                   for a in self._menus()["Help"].actions()}
+        self.assertIn("How to Use", actions)
+        self.assertIn("Check for updates", actions)
+        self.assertIn("About Dataset Scout", actions)
+
+
+class ResultsSortingTests(GuiTestCase):
+    """T4/T11: results are newest first and sortable."""
+
+    def _items(self):
+        return [core.normalize_item({
+            "title": title, "url": f"https://example.com/{title}",
+            "category": "reasoning", "source": "GitHub",
+            "stars": stars, "updated": updated,
+            "license": "", "notes": ""})
+            for title, stars, updated in
+            [("Zulu", 5, "2026-01-01"), ("Alpha", 100, "2026-11-01"),
+             ("Mike", 20, "2026-06-01")]]
+
+    def _shown_titles(self):
+        return [self.window.results_table.item(row, 0).text()
+                for row in range(self.window.results_table.rowCount())]
+
+    def test_results_show_newest_first(self):
+        self.window._search_done(self._items())
+        self.assertEqual(self._shown_titles(), ["Alpha", "Mike", "Zulu"])
+
+    def test_sort_by_stars_is_numeric(self):
+        self.window._search_done(self._items())
+        self.window.results_table.sortByColumn(
+            R_STARS, Qt.SortOrder.AscendingOrder)
+        self.assertEqual(self._shown_titles(), ["Zulu", "Mike", "Alpha"])
+
+    def test_sorting_is_enabled(self):
+        self.assertTrue(self.window.results_table.isSortingEnabled())
+
+
+class RedesignWidgetsTests(GuiTestCase):
+    """T16/T25/T26/T27/T32: the redesigned Search and List tabs."""
+
+    def test_license_combo_has_choices(self):
+        texts = [self.window.license_combo.itemText(n)
+                 for n in range(self.window.license_combo.count())]
+        self.assertIn("Any license", texts)
+        self.assertIn("Apache-2.0", texts)
+        self.assertIn("MIT", texts)
+
+    def test_stella_check_buttons_exist(self):
+        self.assertIsNotNone(self.window.stella_check_button)
+        self.assertIsNotNone(self.window.list_stella_button)
+
+    def test_stats_label_counts_links(self):
+        self.window.my_list = [
+            core.normalize_item({"title": "A",
+                                 "url": "https://example.com/a",
+                                 "status": "ok"}),
+            core.normalize_item({"title": "B",
+                                 "url": "https://example.com/b",
+                                 "status": "dead"}),
+        ]
+        self.window._refresh_stats()
+        text = self.window.stats_label.text()
+        self.assertIn("Links: 2", text)
+        self.assertIn("Working: 1", text)
+        self.assertIn("Dead: 1", text)
+
+    def test_rate_label_exists(self):
+        self.assertIn("GitHub", self.window.rate_label.text())
+
+    def test_empty_labels_visible_when_empty(self):
+        self.assertFalse(self.window.results_empty_label.isHidden())
+        self.assertFalse(self.window.list_empty_label.isHidden())
+
+    def test_skeleton_shows_loading_rows(self):
+        self.window._show_skeleton()
+        self.assertEqual(self.window.results_table.rowCount(), 5)
+        self.assertEqual(
+            self.window.results_table.item(0, 0).text(), "Loading...")
+        self.window._clear_skeleton()
+        self.assertEqual(self.window.results_table.rowCount(), 0)
+
+    def test_shortcuts_come_from_one_registry(self):
+        keys = [key for key, _desc, _scope, _action in SHORTCUTS]
+        self.assertIn("Ctrl+F", keys)
+        self.assertIn("Ctrl+E", keys)
+        self.assertIn("Delete", keys)
+        # The How to Use text is built from the same registry.
+        from scout.gui import HOW_TO_USE_TEXT
+        for key in keys:
+            self.assertIn(key, HOW_TO_USE_TEXT)
+
+
+class CollectionsGuiTests(GuiTestCase):
+    """T30: collections in the window."""
+
+    def _seed(self):
+        core.save_collections("One", [
+            {"name": "One", "items": [
+                {"title": "A", "url": "https://example.com/a"}]},
+            {"name": "Two", "items": [
+                {"title": "B", "url": "https://example.com/b"}]},
+        ])
+        self.window._refresh_collection_combo()
+
+    def test_combo_lists_collections(self):
+        self._seed()
+        names = [self.window.collection_combo.itemText(n)
+                 for n in range(self.window.collection_combo.count())]
+        self.assertEqual(names, ["One", "Two"])
+
+    def test_switching_collections_shows_its_items(self):
+        self._seed()
+        self.window.collection_combo.setCurrentText("Two")
+        self.assertEqual(
+            [item["title"] for item in self.window.my_list], ["B"])
+        self.assertEqual(
+            self.window.list_table.item(0, 0).text(), "B")
+
+    def test_new_collection_from_dialog(self):
+        with unittest.mock.patch.object(
+                QInputDialog, "getText", return_value=("Work", True)):
+            self.window.new_collection()
+        _active, names = core.load_collections()
+        self.assertIn("Work", names)
+        self.assertEqual(self.window._active_collection, "Work")
+
+    def test_delete_last_collection_is_refused(self):
+        self.window.delete_collection()
+        self.assertIn("last list",
+                      self.window.statusBar().currentMessage())
+
+
+class UndoTests(GuiTestCase):
+    """T18: remove asks first and can be undone."""
+
+    def setUp(self):
+        super().setUp()
+        self.window.my_list = [core.normalize_item({
+            "title": title, "url": f"https://example.com/{title}",
+            "category": "reasoning", "source": "GitHub",
+            "stars": 5, "updated": "", "license": "", "notes": ""})
+            for title in ("A", "B")]
+        core.save_list(self.window.my_list)
+        self.window._refresh_list_tab()
+
+    def _remove_row(self, row):
+        self.window.list_table.selectRow(row)
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.window.remove_selected()
+
+    def test_undo_restores_removed_row_in_place(self):
+        self._remove_row(0)
+        self.assertEqual(
+            [item["title"] for item in self.window.my_list], ["B"])
+        self.assertTrue(self.window.undo_button.isEnabled())
+        self.window.undo_remove()
+        self.assertEqual(
+            [item["title"] for item in self.window.my_list], ["A", "B"])
+        self.assertFalse(self.window.undo_button.isEnabled())
+
+    def test_remove_cancelled_keeps_the_row(self):
+        self.window.list_table.selectRow(0)
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.No):
+            self.window.remove_selected()
+        self.assertEqual(len(self.window.my_list), 2)
+
+
+class EditDialogTests(GuiTestCase):
+    """T12: edit a saved link in place."""
+
+    def test_dialog_values_map_the_category(self):
+        item = core.normalize_item(
+            {"title": "A", "url": "https://example.com/a",
+             "category": "reasoning"})
+        dialog = EditItemDialog(item, self.window)
+        dialog.title_field.setText("New title")
+        dialog.category_field.setCurrentText("My Custom")
+        dialog.notes_field.setText("a note")
+        values = dialog.values()
+        self.assertEqual(values["title"], "New title")
+        self.assertEqual(values["category"], "my-custom")
+        self.assertEqual(values["notes"], "a note")
+        dialog.close()
+
+    def test_edit_selected_updates_the_item(self):
+        self.window.my_list = [core.normalize_item({
+            "title": "A", "url": "https://example.com/a",
+            "category": "reasoning", "source": "GitHub",
+            "stars": 5, "updated": "", "license": "", "notes": ""})]
+        core.save_list(self.window.my_list)
+        self.window._refresh_list_tab()
+        self.window.list_table.selectRow(0)
+        fake = unittest.mock.Mock()
+        fake.exec.return_value = QDialog.DialogCode.Accepted
+        fake.values.return_value = {
+            "title": "Renamed", "category": "training",
+            "notes": "edited", "state": "downloaded"}
+        with unittest.mock.patch(
+                "scout.gui.EditItemDialog", return_value=fake):
+            self.window.edit_selected()
+        item = self.window.my_list[0]
+        self.assertEqual(item["title"], "Renamed")
+        self.assertEqual(item["category"], "training")
+        self.assertEqual(item["notes"], "edited")
+        self.assertEqual(item["state"], "downloaded")
+
+
+class SearchCacheGuiTests(GuiTestCase):
+    """T14: a repeated search answers from the cache."""
+
+    def _wait_for_search(self, timeout_ms=5000):
+        deadline = timeout_ms // 50
+        while (not self.window.search_button.isEnabled()
+               and deadline > 0):
+            QTest.qWait(50)
+            deadline -= 1
+        self.assertTrue(self.window.search_button.isEnabled())
+
+    def test_second_identical_search_uses_cache(self):
+        gh = unittest.mock.Mock(return_value=[{
+            "title": "gh", "url": "https://example.com/gh",
+            "category": "all", "source": "GitHub", "stars": 1,
+            "updated": "2026-11-01", "license": "",
+            "description": ""}])
+        hf = unittest.mock.Mock(return_value=[])
+        with unittest.mock.patch.object(apis, "search_github", gh), \
+                unittest.mock.patch.object(apis, "search_huggingface", hf):
+            self.window.search_box.setCurrentText("math")
+            self.window.start_search()
+            self._wait_for_search()
+            self.assertEqual(gh.call_count, 1)
+            self.assertEqual(hf.call_count, 1)
+            self.assertEqual(self.window.results_table.rowCount(), 1)
+            self.window.start_search()
+            self.assertEqual(gh.call_count, 1)
+            self.assertEqual(hf.call_count, 1)
+            self.assertIn("from the last hour",
+                          self.window.statusBar().currentMessage())
+
+
+class SearchStopGuiTests(GuiTestCase):
+    """T3: the search Stop button ends a slow search."""
+
+    def test_stop_button_stops_a_slow_search(self):
+        def slow_github(*args, **kwargs):
+            time.sleep(2)
+            return []
+
+        with unittest.mock.patch.object(
+                apis, "search_github", side_effect=slow_github), \
+                unittest.mock.patch.object(
+                    apis, "search_huggingface", return_value=[]):
+            self.window.search_box.setCurrentText("math")
+            self.window.start_search()
+            self.assertTrue(self.window.stop_search_button.isEnabled())
+            self.window.stop_search()
+            deadline = 100
+            while (not self.window.search_button.isEnabled()
+                   and deadline > 0):
+                QTest.qWait(50)
+                deadline -= 1
+            self.assertTrue(self.window.search_button.isEnabled())
+            self.assertEqual(
+                self.window.statusBar().currentMessage(),
+                "Search stopped.")
+
+
+class ReorderTests(GuiTestCase):
+    """T28: rows move up, down, and by drag."""
+
+    def setUp(self):
+        super().setUp()
+        self.window.my_list = [core.normalize_item({
+            "title": title, "url": f"https://example.com/{title}",
+            "category": "reasoning", "source": "GitHub",
+            "stars": 5, "updated": "", "license": "", "notes": ""})
+            for title in ("A", "B", "C")]
+        core.save_list(self.window.my_list)
+        self.window._refresh_list_tab()
+
+    def _titles(self):
+        return [item["title"] for item in self.window.my_list]
+
+    def test_move_down_swaps_rows(self):
+        self.window.list_table.selectRow(0)
+        self.window._move_selected(1)
+        self.assertEqual(self._titles(), ["B", "A", "C"])
+        self.assertEqual(
+            [item["title"] for item in core.load_list()],
+            ["B", "A", "C"])
+
+    def test_move_up_at_top_is_a_noop(self):
+        self.window.list_table.selectRow(0)
+        self.window._move_selected(-1)
+        self.assertEqual(self._titles(), ["A", "B", "C"])
+
+    def test_drag_reorders_and_saves(self):
+        model = self.window.list_table.model()
+        moved = model.moveRows(QModelIndex(), 0, 1, QModelIndex(), 3)
+        self.assertTrue(moved)
+        QTest.qWait(100)
+        self.assertEqual(self._titles(), ["B", "C", "A"])
+        self.assertEqual(
+            [item["title"] for item in core.load_list()],
+            ["B", "C", "A"])
 
 
 if __name__ == "__main__":

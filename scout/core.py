@@ -12,26 +12,27 @@ use it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 APP_NAME = "Dataset Scout"
 
 # Plain-words note carried by every export (README + exports).
 STELLA_FORMAT_NOTE = (
-    "Before STELLA can use a dataset from one of these links, the "
-    "downloaded data must be converted to STELLA's format: a .jsonl "
-    "file with one JSON object per line, either {\"prompt\", "
-    "\"completion\"} or {\"messages\": [{\"role\", \"content\"}, ...]}, "
-    "one format per file, at least 2 rows. Dataset Scout only finds "
-    "links. It does not download or convert the data."
+    "STELLA trains on a .jsonl file with one JSON object per line, "
+    "either {\"prompt\", \"completion\"} or {\"messages\": [{\"role\", "
+    "\"content\"}, ...]}, one format per file, at least 2 rows. "
+    "Download and convert in Dataset Scout writes that shape into "
+    "a stella-ready folder."
 )
 
 # ---------------------------------------------------------------- home dir
@@ -50,8 +51,45 @@ def home_dir() -> Path:
 def ensure_home() -> Path:
     home = home_dir()
     (home / "logs").mkdir(parents=True, exist_ok=True)
+    _cleanup_old_logs()
     return home
 
+
+def _write_json_atomic(path: Path, payload: dict,
+                       backup: bool = False) -> None:
+    """Write JSON via a tmp file + replace, so a crash mid-write
+    never leaves a half-written file (T2). With backup=True the
+    previous file is kept as <name>.bak first."""
+    ensure_home()
+    if backup and path.is_file():
+        try:
+            shutil.copyfile(path, path.with_name(path.name + ".bak"))
+        except OSError:
+            pass
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+# STELLA-ready check results (T29). "" means not checked yet.
+STELLA_STATUS_LABELS = {
+    "": "Not checked",
+    "ready": "STELLA-ready",
+    "convert": "Needs conversion",
+    "none": "No data files",
+    "unknown": "Check failed",
+}
+
+# Workflow states for a saved link (T30).
+WORKFLOW_STATES = {
+    "found": "Found",
+    "downloaded": "Downloaded",
+    "converted": "Converted",
+    "in-stella": "In STELLA",
+}
 
 # ---------------------------------------------------------------- categories
 
@@ -65,6 +103,64 @@ CATEGORIES = {
 }
 
 CATEGORY_KEYS = list(CATEGORIES.keys())
+
+
+def category_label(key: str) -> str:
+    """Display label for a category key.
+
+    Known keys get their proper label. Anything else is shown as-is,
+    title-cased: categories are data, not a hardcoded list, so an
+    unknown key is never dropped or mislabelled as something else.
+    """
+    if not key:
+        return "All"
+    known = CATEGORIES.get(key)
+    if known:
+        return known[0]
+    return str(key).replace("-", " ").replace("_", " ").title()
+
+
+def category_key_for_label(text: str) -> str:
+    """Turn typed category text into a key (T12).
+
+    A known label ("Reasoning") or key ("reasoning") maps to its
+    key; anything else is slugified into a custom key, so the
+    hand-add form and the edit dialog accept custom categories.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return "all"
+    lowered = cleaned.lower()
+    for key, (label, _suffix) in CATEGORIES.items():
+        if lowered in (key, label.lower()):
+            return key
+    return re.sub(r"[^a-z0-9]+", "-", lowered).strip("-") or "all"
+
+
+def parse_version(tag: str) -> tuple:
+    """A release tag ("v0.1.2") as a comparable tuple (T21)."""
+    try:
+        return tuple(int(part)
+                     for part in str(tag).lstrip("v").split("."))
+    except ValueError:
+        return (0,)
+
+
+def format_size(num_bytes) -> str:
+    """A byte count as plain words ("12 MB", "800 bytes")."""
+    try:
+        size = int(num_bytes)
+    except (TypeError, ValueError):
+        return ""
+    if size < 0:
+        return ""
+    if size < 1024:
+        return f"{size} bytes"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    return f"{size / (1024 * 1024 * 1024):.1f} GB"
 
 # Active window choices: label -> months (None = any age).
 ACTIVE_WINDOWS = {
@@ -184,6 +280,9 @@ def parse_github_results(payload: dict, category: str) -> list[dict]:
             "description": item.get("description") or "",
             "license": license_info.get("spdx_id") or license_info.get("name") or "",
             "topics": list(item.get("topics") or []),
+            "downloads": 0,
+            "format": "",
+            "size_category": "",
             "notes": "",
         })
     return results
@@ -198,11 +297,25 @@ def hf_search_url(query: str, limit: int = 30) -> str:
     return f"{HF_DATASETS_URL}?search={quote_plus(query)}&limit={limit}"
 
 
+def _tag_value(tags: list, prefix: str) -> str:
+    """First tag value after a prefix (license:mit -> mit)."""
+    for tag in tags or []:
+        if isinstance(tag, str) and tag.startswith(prefix):
+            return tag[len(prefix):]
+    return ""
+
+
 def parse_hf_results(payload: list, category: str) -> list[dict]:
-    """Turn a Hugging Face datasets response into Scout result dicts."""
+    """Turn a Hugging Face datasets response into Scout result dicts.
+
+    The tags carry the license, the file format, and the size
+    category (T5): license:mit, format:parquet,
+    size_categories:1K<n<10K. All three are shown in the table.
+    """
     results = []
     for item in payload or []:
         dataset_id = item.get("id") or ""
+        tags = list(item.get("tags") or [])
         results.append({
             "title": dataset_id,
             "url": f"https://huggingface.co/datasets/{dataset_id}" if dataset_id else "",
@@ -211,9 +324,11 @@ def parse_hf_results(payload: list, category: str) -> list[dict]:
             "stars": item.get("likes") or 0,
             "updated": item.get("lastModified") or "",
             "description": "",
-            "license": "",
-            "topics": list(item.get("tags") or []),
+            "license": _tag_value(tags, "license:"),
+            "topics": tags,
             "downloads": item.get("downloads") or 0,
+            "format": _tag_value(tags, "format:"),
+            "size_category": _tag_value(tags, "size_categories:"),
             "notes": "",
         })
     return results
@@ -221,12 +336,21 @@ def parse_hf_results(payload: list, category: str) -> list[dict]:
 
 def filter_results(results: list[dict], active_only: bool,
                    months: int | None, min_stars: int,
-                   now: datetime | None = None) -> list[dict]:
-    """Apply the Active-only window and the min-stars floor."""
+                   now: datetime | None = None,
+                   license_filter: str = "") -> list[dict]:
+    """Apply the Active-only window, the min-stars floor, and the
+    license filter (T32). A license filter keeps only results whose
+    license matches exactly; an unknown license cannot prove a
+    match, so it is hidden while a filter is set."""
     kept = []
+    wanted = (license_filter or "").strip().lower()
     for item in results:
-        if (item.get("stars") or 0) < min_stars:
+        if _safe_int(item.get("stars")) < min_stars:
             continue
+        if wanted:
+            lic = str(item.get("license") or "").strip().lower()
+            if lic != wanted:
+                continue
         if active_only and not is_active(item.get("updated"), months, now):
             continue
         kept.append(item)
@@ -244,11 +368,15 @@ DEFAULT_SOURCES = [
         "name": "Kaggle Datasets",
         "url": "https://www.kaggle.com/datasets?search={q}",
     },
-    {
-        "name": "Papers With Code",
-        "url": "https://paperswithcode.com/search?q={q}",
-    },
 ]
+
+# Dead sources (T31): Papers With Code shut down entirely when
+# Hugging Face bought it — the site and the API both redirect to
+# Hugging Face now, so a saved entry for it is a dead button.
+# Dropped on load; the file itself is cleaned on the next save.
+DEAD_SOURCE_URLS = {
+    "https://paperswithcode.com/search?q={q}",
+}
 
 
 def sources_path() -> Path:
@@ -270,16 +398,14 @@ def load_sources() -> list[dict]:
     out = []
     for site in sites:
         if isinstance(site, dict) and site.get("name") and site.get("url"):
+            if str(site["url"]) in DEAD_SOURCE_URLS:
+                continue
             out.append({"name": str(site["name"]), "url": str(site["url"])})
     return out
 
 
 def save_sources(sites: list[dict]) -> None:
-    ensure_home()
-    sources_path().write_text(
-        json.dumps({"sites": sites}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    _write_json_atomic(sources_path(), {"sites": sites})
 
 
 def restore_default_sources() -> list[dict]:
@@ -313,11 +439,7 @@ def load_config() -> dict:
 
 
 def save_config(config: dict) -> None:
-    ensure_home()
-    config_path().write_text(
-        json.dumps(config, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    _write_json_atomic(config_path(), config)
 
 
 def get_github_token() -> str:
@@ -345,60 +467,196 @@ def list_path() -> Path:
     return home_dir() / "mylist.json"
 
 
-def load_list() -> list[dict]:
+def _migrate_list_data(data) -> dict:
+    """Accept the old {"items": [...]} shape or the collections
+    shape; always return {"active": name, "collections": [...]}."""
+    default = {"active": "My List",
+               "collections": [{"name": "My List", "items": []}]}
+    if not isinstance(data, dict):
+        return default
+    raw = data.get("collections")
+    if isinstance(raw, list):
+        collections = []
+        for col in raw:
+            if isinstance(col, dict) and col.get("name"):
+                items = col.get("items")
+                if not isinstance(items, list):
+                    items = []
+                collections.append({"name": str(col["name"]),
+                                    "items": items})
+        if not collections:
+            return default
+        active = str(data.get("active") or collections[0]["name"])
+        if active not in [c["name"] for c in collections]:
+            active = collections[0]["name"]
+        return {"active": active, "collections": collections}
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+    return {"active": "My List",
+            "collections": [{"name": "My List", "items": items}]}
+
+
+def _read_list_file() -> dict:
+    """The saved list file, migrated to collections shape (T30)."""
     path = list_path()
     if not path.is_file():
-        return []
+        return _migrate_list_data(None)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return []
+        return _migrate_list_data(None)
+    return _migrate_list_data(data)
+
+
+def _clean_items(items) -> list[dict]:
     out = []
-    for item in items:
+    for item in items or []:
         if isinstance(item, dict) and item.get("url"):
-            out.append(normalize_item(item))
+            try:
+                out.append(normalize_item(item))
+            except Exception as exc:  # noqa: BLE001 - one bad row must not lose the list
+                log(f"Skipping a bad row in My List: {exc}", level="WARNING")
     return out
 
 
+def load_list_data() -> dict:
+    """The whole saved list file: active collection + all lists."""
+    return _read_list_file()
+
+
+def load_collections() -> tuple[str, list[str]]:
+    """(active collection name, all collection names)."""
+    data = _read_list_file()
+    return data["active"], [c["name"] for c in data["collections"]]
+
+
+def load_list() -> list[dict]:
+    """Items in the active collection (the old single list)."""
+    data = _read_list_file()
+    for col in data["collections"]:
+        if col["name"] == data["active"]:
+            return _clean_items(col["items"])
+    return []
+
+
 def save_list(items: list[dict]) -> None:
-    ensure_home()
-    list_path().write_text(
-        json.dumps({"items": items}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    """Save items into the active collection, keeping the others."""
+    data = _read_list_file()
+    for col in data["collections"]:
+        if col["name"] == data["active"]:
+            col["items"] = [normalize_item(item) for item in items]
+            break
+    _write_json_atomic(list_path(), data, backup=True)
+
+
+def save_collections(active: str, collections: list[dict]) -> None:
+    """Save the full collections file."""
+    data = {
+        "active": active,
+        "collections": [
+            {"name": str(col.get("name") or "My List"),
+             "items": [normalize_item(item)
+                       for item in col.get("items") or []]}
+            for col in collections
+        ],
+    }
+    _write_json_atomic(list_path(), data, backup=True)
+
+
+def _safe_int(value) -> int:
+    """Coerce to int; anything unparseable becomes 0 (T1: a bad
+    number in a saved file must never crash the app)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def normalize_item(item: dict) -> dict:
     """Fill every field a list item carries, with safe defaults."""
+    files = item.get("stella_files") or []
+    if not isinstance(files, list):
+        files = []
     return {
         "title": str(item.get("title") or item.get("url") or ""),
         "url": str(item.get("url") or ""),
         "category": str(item.get("category") or "all"),
         "source": str(item.get("source") or ""),
-        "stars": int(item.get("stars") or 0),
+        "stars": _safe_int(item.get("stars") or 0),
         "updated": str(item.get("updated") or ""),
         "license": str(item.get("license") or ""),
         "notes": str(item.get("notes") or ""),
         "status": str(item.get("status") or ""),
+        "downloads": _safe_int(item.get("downloads") or 0),
+        "format": str(item.get("format") or ""),
+        "size_category": str(item.get("size_category") or ""),
+        "stella_status": str(item.get("stella_status") or ""),
+        "stella_files": [str(entry) for entry in files],
+        "stella_size": _safe_int(item.get("stella_size") or 0),
+        "state": str(item.get("state") or "found"),
     }
+
+
+def normalize_url(url: str) -> str:
+    """Canonical form of a URL, for dedup only (T7).
+
+    Lowercase scheme and host, drop default ports and a leading
+    www., strip a trailing slash and the fragment. The stored URL
+    keeps its original shape; only comparisons use this form.
+    """
+    text = (url or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "https://" + text
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return text
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if (scheme == "http" and port == 80) or \
+            (scheme == "https" and port == 443):
+        port = None
+    netloc = host
+    if port:
+        netloc += f":{port}"
+    if parsed.username:
+        auth = parsed.username
+        if parsed.password:
+            auth += f":{parsed.password}"
+        netloc = f"{auth}@{netloc}"
+    path = parsed.path or ""
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, parsed.query, ""))
 
 
 def add_to_list(items: list[dict], new_item: dict) -> tuple[list[dict], bool]:
     """Add an item unless its URL is already in the list.
 
     Returns (items, added). The list is saved by the caller.
+    Comparison uses the normalised URL, so a trailing slash or a
+    www. does not create a second entry (T7).
     """
     item = normalize_item(new_item)
-    if any(existing["url"] == item["url"] for existing in items):
+    key = normalize_url(item["url"])
+    if any(normalize_url(existing["url"]) == key for existing in items):
         return items, False
     return items + [item], True
 
 
 def remove_from_list(items: list[dict], url: str) -> list[dict]:
-    return [item for item in items if item["url"] != url]
+    key = normalize_url(url)
+    return [item for item in items
+            if normalize_url(item["url"]) != key]
 
 
 # ---------------------------------------------------------------- exports
@@ -411,11 +669,15 @@ def export_markdown(items: list[dict], name: str = "Dataset Scout list") -> str:
     grouped: dict[str, list[dict]] = {}
     for item in items:
         grouped.setdefault(item.get("category") or "all", []).append(item)
-    for key in CATEGORY_KEYS:
-        group = grouped.get(key)
-        if not group:
-            continue
-        label = CATEGORIES[key][0]
+    # Known categories first, in their usual order, then anything
+    # else alphabetically. Every category present gets a section:
+    # categories are data, not a hardcoded list, so nothing is ever
+    # dropped for being unknown.
+    ordered = [key for key in CATEGORY_KEYS if key in grouped]
+    ordered += sorted(key for key in grouped if key not in CATEGORY_KEYS)
+    for key in ordered:
+        group = grouped[key]
+        label = category_label(key)
         lines.append(f"## {label}")
         lines.append("")
         for item in group:
@@ -431,6 +693,14 @@ def export_markdown(items: list[dict], name: str = "Dataset Scout list") -> str:
                 details.append(f"updated {format_date(item['updated'])}")
             if item.get("license"):
                 details.append(f"license {item['license']}")
+            if item.get("format"):
+                details.append(f"format {item['format']}")
+            if item.get("downloads"):
+                details.append(f"{item['downloads']} downloads")
+            if item.get("stella_status"):
+                label = STELLA_STATUS_LABELS.get(
+                    item["stella_status"], item["stella_status"])
+                details.append(label)
             if details:
                 lines.append(f"  {', '.join(details)}")
             if item.get("notes"):
@@ -464,10 +734,16 @@ def export_stella_manifest(items: list[dict],
                 "url": item.get("url") or "",
                 "category": item.get("category") or "all",
                 "source": item.get("source") or "",
-                "stars": int(item.get("stars") or 0),
+                "stars": _safe_int(item.get("stars") or 0),
                 "updated": item.get("updated") or "",
                 "license": item.get("license") or "",
                 "notes": item.get("notes") or "",
+                "downloads": _safe_int(item.get("downloads") or 0),
+                "format": item.get("format") or "",
+                "size_category": item.get("size_category") or "",
+                "stella_status": item.get("stella_status") or "",
+                "stella_size": _safe_int(item.get("stella_size") or 0),
+                "state": item.get("state") or "found",
             }
             for item in items
         ],
@@ -475,10 +751,230 @@ def export_stella_manifest(items: list[dict],
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------- import (T13)
+
+def import_json_text(text: str) -> list[dict]:
+    """Parse a JSON or STELLA-manifest export back into items."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("That file is not a JSON list.") from exc
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("That file does not hold a Dataset Scout list.")
+    return [normalize_item(item) for item in items
+            if isinstance(item, dict) and item.get("url")]
+
+
+def import_markdown_text(text: str) -> list[dict]:
+    """Parse a Markdown export back into items.
+
+    Links come from "- [title](url)" lines; the category comes from
+    the "## Heading" above them, mapped back to a key when the
+    heading is a known label, slugified otherwise. A "Note: ..."
+    line after a link becomes that item's note.
+    """
+    label_to_key = {label.lower(): key
+                    for key, (label, _suffix) in CATEGORIES.items()}
+    link_re = re.compile(r"^-\s*\[(?P<title>.*?)\]\((?P<url>.*?)\)\s*$")
+    items: list[dict] = []
+    category = "all"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            heading = stripped[3:].strip()
+            category = label_to_key.get(
+                heading.lower(),
+                re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
+                or "all")
+            continue
+        match = link_re.match(stripped)
+        if match:
+            items.append(normalize_item({
+                "title": match.group("title") or match.group("url"),
+                "url": match.group("url"),
+                "category": category,
+            }))
+            continue
+        if stripped.startswith("Note: ") and items:
+            items[-1]["notes"] = stripped[len("Note: "):].strip()
+    return items
+
+
+def import_file_text(text: str) -> list[dict]:
+    """Import from export text: JSON when it parses as JSON, else
+    Markdown. Raises ValueError with a plain message when the text
+    holds no usable list."""
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        items = import_json_text(text)
+        if not items:
+            raise ValueError("That JSON file holds no links.")
+        return items
+    items = import_markdown_text(text)
+    if not items:
+        raise ValueError("No links found in that file.")
+    return items
+
+
+# ---------------------------------------------------------------- search cache + history (T14)
+
+SEARCH_CACHE_TTL = 3600  # 1 hour
+SEARCH_CACHE_MAX = 20
+HISTORY_MAX = 10
+
+
+def _cache_key(query: str, category: str) -> str:
+    return hashlib.sha256(
+        f"{category}\0{query}".encode("utf-8")).hexdigest()
+
+
+def load_search_cache(query: str, category: str) -> list[dict] | None:
+    """Cached results for an identical search, or None."""
+    path = home_dir() / "cache.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get(_cache_key(query, category))
+    if not isinstance(entry, dict):
+        return None
+    saved = parse_iso_date(entry.get("saved"))
+    if saved is None:
+        return None
+    age = (datetime.now(timezone.utc) - saved).total_seconds()
+    if age > SEARCH_CACHE_TTL:
+        return None
+    results = entry.get("results")
+    if not isinstance(results, list):
+        return None
+    return results
+
+
+def save_search_cache(query: str, category: str,
+                      results: list[dict]) -> None:
+    """Cache one search's results; oldest entries drop past the cap."""
+    path = home_dir() / "cache.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, dict):
+        entries = {}
+    entries[_cache_key(query, category)] = {
+        "query": query,
+        "category": category,
+        "saved": datetime.now(timezone.utc).isoformat(),
+        "results": results,
+    }
+    while len(entries) > SEARCH_CACHE_MAX:
+        oldest = min(
+            entries,
+            key=lambda k: str(entries[k].get("saved") or ""))
+        del entries[oldest]
+    _write_json_atomic(path, {"entries": entries})
+
+
+def load_history() -> list[dict]:
+    """Recent searches, most recent first."""
+    path = home_dir() / "history.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    recent = data.get("recent") if isinstance(data, dict) else None
+    if not isinstance(recent, list):
+        return []
+    return [entry for entry in recent
+            if isinstance(entry, dict) and entry.get("query")]
+
+
+def save_history(query: str, category: str) -> None:
+    """Remember one search; newest first, no repeats, capped."""
+    query = (query or "").strip()
+    if not query:
+        return
+    recent = [entry for entry in load_history()
+              if not (entry.get("query") == query
+                      and entry.get("category") == category)]
+    recent.insert(0, {"query": query, "category": category})
+    _write_json_atomic(home_dir() / "history.json",
+                       {"recent": recent[:HISTORY_MAX]})
+
+
+# ---------------------------------------------------------------- stats + STELLA home
+
+def searches_run() -> int:
+    """How many searches this install has run (T25 stats strip)."""
+    return _safe_int(load_config().get("searches_run"))
+
+
+def bump_search_count() -> int:
+    count = searches_run() + 1
+    config = load_config()
+    config["searches_run"] = count
+    save_config(config)
+    return count
+
+
+def stella_home() -> Path | None:
+    """STELLA's home dir when STELLA is installed, else None (T33).
+
+    STELLA_HOME wins; otherwise ~/.stella. "Installed" means the
+    directory exists. STELLA reads datasets by file path, so the
+    manifest is written here for the user to find, not consumed
+    by STELLA itself.
+    """
+    override = os.environ.get("STELLA_HOME")
+    if override:
+        path = Path(override)
+        return path if path.is_dir() else None
+    path = Path.home() / ".stella"
+    return path if path.is_dir() else None
+
+
 # ---------------------------------------------------------------- debug log
 
 _RING: list[str] = []
 _RING_MAX = 200
+
+
+_LOG_CLEANUP_DONE = False
+
+
+def _cleanup_old_logs() -> None:
+    """Delete daily log files older than 7 days (T8).
+
+    Runs once per process; a failure here never breaks anything.
+    """
+    global _LOG_CLEANUP_DONE
+    if _LOG_CLEANUP_DONE:
+        return
+    _LOG_CLEANUP_DONE = True
+    try:
+        logs_dir = home_dir() / "logs"
+        if not logs_dir.is_dir():
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        for path in logs_dir.glob("scout-*.log"):
+            try:
+                stamp = path.stem.split("-", 1)[1]
+                day = datetime.strptime(stamp, "%Y%m%d")
+                day = day.replace(tzinfo=timezone.utc)
+            except (IndexError, ValueError):
+                continue
+            if day < cutoff:
+                path.unlink()
+    except OSError:
+        pass
 
 
 def _log_file() -> Path:

@@ -6,7 +6,12 @@
     scout-cli sources remove <name>
     scout-cli sources defaults
     scout-cli list
+    scout-cli add <url> [--title T] [--category C] [--note N]
+    scout-cli remove <url>
+    scout-cli check
+    scout-cli import <file>
     scout-cli export <format> <file>     # format: md, json, stella
+    scout-cli update-check
 """
 
 from __future__ import annotations
@@ -20,22 +25,36 @@ from . import apis, core
 def _cmd_search(args: argparse.Namespace) -> int:
     query = core.build_query(args.query, args.category)
     print(f"Searching for: {query}")
+    results: list[dict] = []
+    failures: list[tuple[str, str]] = []
     try:
         results = apis.search_github(query, args.category,
                                      token=core.get_github_token(),
                                      per_page=args.limit)
-        results += apis.search_huggingface(query, args.category,
-                                           limit=args.limit)
     except (apis.SearchError, core.RateLimitedError) as exc:
         core.log_error(f"CLI search failed: {exc}")
-        print(f"Search failed: {exc}", file=sys.stderr)
+        failures.append(("GitHub", str(exc)))
+    try:
+        results += apis.search_huggingface(query, args.category,
+                                           limit=args.limit)
+    except apis.SearchError as exc:
+        core.log_error(f"CLI search failed: {exc}")
+        failures.append(("Hugging Face", str(exc)))
+    if len(failures) == 2:
+        detail = "; ".join(f"{name}: {reason}"
+                           for name, reason in failures)
+        print(f"Search failed. {detail}", file=sys.stderr)
         return 1
     results = core.filter_results(
         results,
         active_only=not args.include_inactive,
         months=None if args.include_inactive else core.DEFAULT_ACTIVE_MONTHS,
         min_stars=args.min_stars,
+        license_filter=args.license or "",
     )
+    if failures:
+        print(f"Note: {failures[0][0]} search did not answer.",
+              file=sys.stderr)
     if not results:
         print("No results.")
         return 0
@@ -80,8 +99,89 @@ def _cmd_list(_args: argparse.Namespace) -> int:
         print("My List is empty.")
         return 0
     for item in items:
-        print(f"- {item['title']} [{item['category']}]")
+        state = core.WORKFLOW_STATES.get(item.get("state") or "found",
+                                         "Found")
+        print(f"- {item['title']} [{item['category']}] [{state}]")
         print(f"  {item['url']}")
+    return 0
+
+
+def _cmd_add(args: argparse.Namespace) -> int:
+    url = (args.url or "").strip()
+    if not url:
+        print("Give a link first.", file=sys.stderr)
+        return 1
+    if "://" not in url:
+        url = "https://" + url
+    item = {
+        "title": (args.title or "").strip() or url,
+        "url": url,
+        "category": args.category,
+        "source": "Found by hand",
+        "stars": 0,
+        "updated": "",
+        "license": "",
+        "notes": (args.note or "").strip(),
+    }
+    items = core.load_list()
+    items, added = core.add_to_list(items, item)
+    if not added:
+        print("That link is already in My List.")
+        return 0
+    core.save_list(items)
+    print(f"Added {item['title']} to My List.")
+    return 0
+
+
+def _cmd_remove(args: argparse.Namespace) -> int:
+    items = core.load_list()
+    before = len(items)
+    items = core.remove_from_list(items, args.url)
+    if len(items) == before:
+        print("That link is not in My List.")
+        return 0
+    core.save_list(items)
+    print("Removed from My List.")
+    return 0
+
+
+def _cmd_check(_args: argparse.Namespace) -> int:
+    items = core.load_list()
+    if not items:
+        print("My List is empty. Nothing to check.")
+        return 0
+    counts = {"ok": 0, "dead": 0, "unknown": 0}
+    for item in items:
+        status = apis.check_link(item["url"])
+        item["status"] = status
+        counts[status] = counts.get(status, 0) + 1
+        print(f"- {item['title']}: {status}")
+    core.save_list(items)
+    print(f"{counts.get('ok', 0)} working, {counts.get('dead', 0)} dead, "
+          f"{counts.get('unknown', 0)} unknown.")
+    return 0
+
+
+def _cmd_import(args: argparse.Namespace) -> int:
+    try:
+        with open(args.file, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        print(f"Could not read {args.file}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        found = core.import_file_text(text)
+    except ValueError as exc:
+        print(f"Import failed: {exc}", file=sys.stderr)
+        return 1
+    items = core.load_list()
+    added = 0
+    for item in found:
+        items, was_added = core.add_to_list(items, item)
+        added += 1 if was_added else 0
+    core.save_list(items)
+    print(f"Imported {added} links "
+          f"({len(found) - added} already in the list).")
     return 0
 
 
@@ -103,6 +203,18 @@ def _cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_update_check(_args: argparse.Namespace) -> int:
+    tag = apis.latest_release_tag()
+    if not tag:
+        print("Could not reach GitHub to check for updates.")
+        return 1
+    if core.parse_version(tag) <= core.parse_version(core.VERSION):
+        print(f"Dataset Scout {core.VERSION} is the latest version.")
+    else:
+        print(f"Version {tag} is out. You have {core.VERSION}.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scout-cli",
@@ -116,6 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=list(core.CATEGORIES))
     search.add_argument("--limit", type=int, default=30)
     search.add_argument("--min-stars", type=int, default=0)
+    search.add_argument("--license", default="",
+                        help="Keep only results with this license.")
     search.add_argument("--include-inactive", action="store_true",
                         help="Include results not updated recently.")
     search.set_defaults(func=_cmd_search)
@@ -129,10 +243,33 @@ def build_parser() -> argparse.ArgumentParser:
     lst = sub.add_parser("list", help="Show My List.")
     lst.set_defaults(func=_cmd_list)
 
+    add = sub.add_parser("add", help="Add a link to My List.")
+    add.add_argument("url")
+    add.add_argument("--title", default="")
+    add.add_argument("--category", default="all")
+    add.add_argument("--note", default="")
+    add.set_defaults(func=_cmd_add)
+
+    remove = sub.add_parser("remove", help="Remove a link from My List.")
+    remove.add_argument("url")
+    remove.set_defaults(func=_cmd_remove)
+
+    check = sub.add_parser("check", help="Check every link in My List.")
+    check.set_defaults(func=_cmd_check)
+
+    imp = sub.add_parser("import",
+                         help="Import a Markdown, JSON, or STELLA export.")
+    imp.add_argument("file")
+    imp.set_defaults(func=_cmd_import)
+
     export = sub.add_parser("export", help="Export My List to a file.")
     export.add_argument("format", choices=["md", "json", "stella"])
     export.add_argument("file")
     export.set_defaults(func=_cmd_export)
+
+    update = sub.add_parser("update-check",
+                            help="Say whether a newer version is out.")
+    update.set_defaults(func=_cmd_update_check)
     return parser
 
 
