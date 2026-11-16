@@ -194,6 +194,34 @@ class SearchCliTests(CliTestCase):
         self.assertEqual(code, 0)
         self.assertIn("No results.", text)
 
+    def test_search_empty_says_how_many_filters_hid(self):
+        # The CLI must say how many results the filters hid, like
+        # the window does, instead of a bare "No results."
+        with unittest.mock.patch.object(
+                apis, "search_github", return_value=[]), \
+                unittest.mock.patch.object(
+                    apis, "search_huggingface",
+                    return_value=self.FAKE):
+            code, text = self.run_cli(
+                ["search", "math", "--license", "Apache-2.0"])
+        self.assertEqual(code, 0)
+        self.assertIn("No results.", text)
+        self.assertIn("(1 hidden by filters)", text)
+
+    def test_search_found_line_names_hidden_count(self):
+        stale = {"title": "old", "url": "https://example.com/old",
+                 "category": "all", "source": "Hugging Face",
+                 "stars": 0, "updated": "2020-01-01",
+                 "license": "MIT", "description": ""}
+        with unittest.mock.patch.object(
+                apis, "search_github", return_value=[]), \
+                unittest.mock.patch.object(
+                    apis, "search_huggingface",
+                    return_value=self.FAKE + [stale]):
+            code, text = self.run_cli(["search", "math"])
+        self.assertEqual(code, 0)
+        self.assertIn("Found 1 results (1 hidden by filters).", text)
+
     def test_search_results_are_newest_first(self):
         # v0.1.3 T32/T37: the CLI sorts like the GUI, by parsed time.
         # The +12:00 string sorts after the Zulu string, but it is

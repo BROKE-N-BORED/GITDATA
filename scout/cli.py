@@ -55,6 +55,7 @@ def _cmd_search(args: argparse.Namespace) -> int:
                            for name, reason in failures)
         print(f"Search failed. {detail}", file=sys.stderr)
         return 1
+    found = len(results)
     results = core.filter_results(
         results,
         active_only=not args.include_inactive,
@@ -62,14 +63,21 @@ def _cmd_search(args: argparse.Namespace) -> int:
         min_stars=args.min_stars,
         license_filter=args.license or "",
     )
+    hidden = found - len(results)
     # Newest first, like the GUI (v0.1.3 T32/T37).
     results.sort(key=core.updated_sort_key, reverse=True)
     if failures:
         print(f"Note: {failures[0][0]} search did not answer.",
               file=sys.stderr)
     if not results:
-        print("No results.")
+        if hidden:
+            print(f"No results. ({hidden} hidden by filters)")
+        else:
+            print("No results.")
         return 0
+    print(f"Found {len(results)} results"
+          + (f" ({hidden} hidden by filters)" if hidden else "")
+          + ".")
     for item in results:
         print(
             f"- {item['title']} [{item['source']}] "

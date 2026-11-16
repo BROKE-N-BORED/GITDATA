@@ -71,6 +71,7 @@ All 67 items from the v0.1.2 audit, in one release.
 - T65: A plain-words quality score on each result, from activity, popularity, license, and STELLA shape
 - T66: A bulk download queue with pause and resume across sessions
 - T67: Offline mode: browse cached results and convert local files with an honest "you are offline" note
+- Verification fix: the command line search now says how many results the filters hid, like the window does, instead of a bare "No results."
 
 ## v0.1.2 (2026-11-13)
 
