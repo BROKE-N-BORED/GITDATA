@@ -111,6 +111,16 @@ class ImportExportTests(CliTestCase):
             ["import", str(Path(self.tmp.name) / "nope.md")])
         self.assertEqual(code, 1)
 
+    def test_import_with_bom(self):
+        # v0.1.3 T35: a byte-order mark does not break the import.
+        md = ("\ufeff# Dataset Scout list\n\n"
+              "- [Alpha](https://example.com/a)\n")
+        path = Path(self.tmp.name) / "list.md"
+        path.write_text(md, encoding="utf-8")
+        code, text = self.run_cli(["import", str(path)])
+        self.assertEqual(code, 0)
+        self.assertIn("Imported 1 links", text)
+
     def test_export_all_formats(self):
         self.run_cli(["add", "https://example.com/a",
                       "--title", "Alpha"])
@@ -150,9 +160,28 @@ class SearchCliTests(CliTestCase):
                 side_effect=apis.SearchError("down")), \
                 unittest.mock.patch.object(
                     apis, "search_huggingface",
-                    side_effect=apis.SearchError("down")):
+                    side_effect=apis.SearchError("down")), \
+                unittest.mock.patch.object(
+                    apis, "is_online", return_value=True):
             code, _text = self.run_cli(["search", "math"])
         self.assertEqual(code, 1)
+
+    def test_search_both_fail_offline_says_so(self):
+        import io
+        from contextlib import redirect_stderr
+        err = io.StringIO()
+        with redirect_stderr(err), \
+                unittest.mock.patch.object(
+                    apis, "search_github",
+                    side_effect=apis.SearchError("down")), \
+                unittest.mock.patch.object(
+                    apis, "search_huggingface",
+                    side_effect=apis.SearchError("down")), \
+                unittest.mock.patch.object(
+                    apis, "is_online", return_value=False):
+            code, _text = self.run_cli(["search", "math"])
+        self.assertEqual(code, 1)
+        self.assertIn("offline", err.getvalue().lower())
 
     def test_search_license_filter(self):
         with unittest.mock.patch.object(
@@ -164,6 +193,40 @@ class SearchCliTests(CliTestCase):
                 ["search", "math", "--license", "Apache-2.0"])
         self.assertEqual(code, 0)
         self.assertIn("No results.", text)
+
+    def test_search_results_are_newest_first(self):
+        # v0.1.3 T32/T37: the CLI sorts like the GUI, by parsed time.
+        # The +12:00 string sorts after the Zulu string, but it is
+        # the earlier instant.
+        results = [
+            {"title": "old", "url": "https://example.com/old",
+             "category": "all", "source": "GitHub", "stars": 1,
+             "updated": "2026-01-01T00:00:00+12:00",
+             "license": "", "description": ""},
+            {"title": "new", "url": "https://example.com/new",
+             "category": "all", "source": "GitHub", "stars": 1,
+             "updated": "2025-12-31T13:00:00Z",
+             "license": "", "description": ""},
+        ]
+        with unittest.mock.patch.object(
+                apis, "search_github", return_value=results), \
+                unittest.mock.patch.object(
+                    apis, "search_huggingface", return_value=[]):
+            code, text = self.run_cli(
+                ["search", "math", "--include-inactive"])
+        self.assertEqual(code, 0)
+        self.assertLess(text.index("new"), text.index("old"))
+
+    def test_search_limit_is_clamped_to_100(self):
+        # v0.1.3 T43: GitHub takes at most 100 per page.
+        gh = unittest.mock.Mock(return_value=[])
+        hf = unittest.mock.Mock(return_value=[])
+        with unittest.mock.patch.object(apis, "search_github", gh), \
+                unittest.mock.patch.object(apis, "search_huggingface", hf):
+            code, _text = self.run_cli(["search", "math", "--limit", "500"])
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.call_args[1]["per_page"], 100)
+        self.assertEqual(hf.call_args[1]["limit"], 100)
 
 
 class UpdateCheckTests(CliTestCase):
@@ -209,6 +272,45 @@ class SourcesCliTests(CliTestCase):
         _code, text = self.run_cli(["sources", "list"])
         self.assertIn("Hugging Face Datasets", text)
         self.assertNotIn("Example", text)
+
+
+class SelfTestTests(CliTestCase):
+    """v0.1.3 T42: --self-test exercises search, sniff, convert."""
+
+    def test_self_test_passes_with_mocked_network(self):
+        item = {"title": "a/b", "url": "https://example.com/a/b",
+                "source": "Hugging Face"}
+        with unittest.mock.patch.object(
+                apis, "search_github", return_value=[item]), \
+                unittest.mock.patch.object(
+                    apis, "search_huggingface", return_value=[]), \
+                unittest.mock.patch.object(
+                    apis, "sniff_item",
+                    return_value={"status": "ready", "detail": "ok"}):
+            code, text = self.run_cli(["--self-test"])
+        self.assertEqual(code, 0)
+        self.assertIn("PASS: Search", text)
+        self.assertIn("PASS: Sniff", text)
+        self.assertIn("PASS: Convert", text)
+        self.assertIn("3 of 3 checks passed", text)
+
+    def test_self_test_fails_when_both_sources_are_down(self):
+        with unittest.mock.patch.object(
+                apis, "search_github",
+                side_effect=apis.SearchError("down")), \
+                unittest.mock.patch.object(
+                    apis, "search_huggingface",
+                    side_effect=apis.SearchError("down")):
+            code, text = self.run_cli(["--self-test"])
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL: Search", text)
+        self.assertIn("FAIL: Sniff", text)
+        self.assertIn("PASS: Convert", text)
+
+    def test_no_command_prints_help_and_returns_two(self):
+        code, text = self.run_cli([])
+        self.assertEqual(code, 2)
+        self.assertIn("scout-cli", text)
 
 
 if __name__ == "__main__":

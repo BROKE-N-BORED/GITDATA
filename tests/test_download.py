@@ -51,7 +51,8 @@ class HuggingFaceDownloadTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_jsonl_file_converts_to_stella_jsonl(self):
-        def fake_download(url, dest, progress=None, chunk=262144):
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
             Path(dest).write_text(JSONL, encoding="utf-8")
             return len(JSONL)
 
@@ -76,8 +77,29 @@ class HuggingFaceDownloadTests(unittest.TestCase):
         # The temp work dir is cleaned up.
         self.assertEqual(list(self.out.glob(".tmp-*")), [])
 
-    def test_parquet_is_named_as_skipped_not_converted(self):
-        def fake_download(url, dest, progress=None, chunk=262144):
+    def test_parquet_converts_when_the_reader_is_installed(self):
+        # T62: Parquet is no longer skipped — with the reader
+        # installed it converts like any other kind. A fake
+        # download writes a real Parquet file (built with
+        # pyarrow); the test is skipped where pyarrow is absent.
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is not installed")
+        parquet_path = Path(self.tmp.name) / "fixture.parquet"
+        table = pa.Table.from_pylist([
+            {"prompt": "a", "completion": "b"},
+            {"prompt": "c", "completion": "d"},
+        ])
+        pq.write_table(table, parquet_path)
+        blob = parquet_path.read_bytes()
+
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
+            if str(dest).endswith(".parquet"):
+                Path(dest).write_bytes(blob)
+                return len(blob)
             Path(dest).write_text(JSONL, encoding="utf-8")
             return len(JSONL)
 
@@ -91,14 +113,36 @@ class HuggingFaceDownloadTests(unittest.TestCase):
                     apis, "download_file", side_effect=fake_download):
             report = download.download_and_convert(_hf_item(), self.out)
         self.assertTrue(report["ok"])
-        self.assertIn("train.parquet", report["message"])
-        self.assertIn("Parquet", report["message"])
+        self.assertEqual(report["rows"], 4)
+        self.assertEqual(len(report["outputs"]), 2)
+
+    def test_parquet_without_the_reader_is_refused_plainly(self):
+        # T62: without the reader installed, a Parquet-only
+        # dataset is refused with the missing-reader message,
+        # before anything is downloaded.
+        with unittest.mock.patch.object(
+                apis, "sniff_huggingface",
+                return_value={"status": "needs-reader",
+                              "files": ["data/train.parquet"],
+                              "total_size": 100,
+                              "detail": "has Parquet files, but the "
+                                        "Parquet reader is not "
+                                        "installed, so Scout cannot "
+                                        "convert them yet"}), \
+                unittest.mock.patch.object(
+                    apis, "download_file") as fake_download:
+            report = download.download_and_convert(_hf_item(), self.out)
+        self.assertFalse(report["ok"])
+        self.assertIn("Parquet reader", report["message"])
+        fake_download.assert_not_called()
 
     def test_no_convertible_files_reports_plainly(self):
+        # An Arrow file is genuinely not convertible (T62 made
+        # Parquet convertible, so it no longer serves here).
         with unittest.mock.patch.object(
                 apis, "sniff_huggingface",
                 return_value={"status": "none",
-                              "files": ["data/train.parquet"],
+                              "files": ["data/train.arrow"],
                               "total_size": 100, "detail": ""}):
             report = download.download_and_convert(_hf_item(), self.out)
         self.assertFalse(report["ok"])
@@ -116,7 +160,8 @@ class HuggingFaceDownloadTests(unittest.TestCase):
         self.assertIn("not found", report["message"])
 
     def test_one_row_is_not_enough(self):
-        def fake_download(url, dest, progress=None, chunk=262144):
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
             Path(dest).write_text(
                 '{"prompt": "a", "completion": "b"}\n', encoding="utf-8")
             return 30
@@ -138,13 +183,20 @@ class GitHubDownloadTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.out = Path(self.tmp.name)
+        # The archive pre-check HEADs the archive URL; tests answer
+        # "unknown size" so no live request escapes.
+        self._cl = unittest.mock.patch.object(
+            apis, "content_length", return_value=None)
+        self._cl.start()
 
     def tearDown(self):
+        self._cl.stop()
         self.tmp.cleanup()
 
     def _fake_archive_download(self, files):
         """A download_file stand-in that writes a zip of files."""
-        def fake_download(url, dest, progress=None, chunk=262144):
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
             with zipfile.ZipFile(dest, "w") as zf:
                 for name, text in files.items():
                     zf.writestr(name, text)
@@ -191,7 +243,8 @@ class GitHubDownloadTests(unittest.TestCase):
         self.assertFalse((self.out / "escape.jsonl").exists())
 
     def test_bad_archive_reports_plainly(self):
-        def fake_download(url, dest, progress=None, chunk=262144):
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
             Path(dest).write_bytes(b"this is not a zip")
             return 17
 
@@ -207,6 +260,74 @@ class GitHubDownloadTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertIn("not a zip", report["message"])
 
+    def test_extraction_byte_cap_refuses_plainly(self):
+        # v0.1.3 T29: an archive that would expand past the cap is
+        # refused, in plain words naming the cap.
+        with unittest.mock.patch.object(
+                apis, "sniff_github",
+                return_value={"status": "convert",
+                              "files": ["data.json"],
+                              "total_size": None, "detail": "",
+                              "branch": "main"}), \
+                unittest.mock.patch.object(
+                    apis, "download_file",
+                    side_effect=self._fake_archive_download(
+                        {"tiny-repo-main/data.json": INSTRUCTION_JSON})), \
+                unittest.mock.patch.object(
+                    download, "MAX_EXTRACTED_BYTES", 10):
+            report = download.download_and_convert(_gh_item(), self.out)
+        self.assertFalse(report["ok"])
+        self.assertIn("expand to over", report["message"])
+
+    def test_extraction_member_cap_refuses_plainly(self):
+        # v0.1.3 T29: an archive with too many members is refused.
+        with unittest.mock.patch.object(
+                apis, "sniff_github",
+                return_value={"status": "convert",
+                              "files": ["a.json", "b.json"],
+                              "total_size": None, "detail": "",
+                              "branch": "main"}), \
+                unittest.mock.patch.object(
+                    apis, "download_file",
+                    side_effect=self._fake_archive_download(
+                        {"tiny-repo-main/a.json": INSTRUCTION_JSON,
+                         "tiny-repo-main/b.json": INSTRUCTION_JSON})), \
+                unittest.mock.patch.object(
+                    download, "MAX_EXTRACTED_MEMBERS", 1):
+            report = download.download_and_convert(_gh_item(), self.out)
+        self.assertFalse(report["ok"])
+        self.assertIn("too many files", report["message"])
+
+    def test_sibling_prefix_member_is_not_extracted(self):
+        # v0.1.3 T38: a member resolving to a sibling folder whose
+        # name starts with the extract folder's name ("repo-evil")
+        # is outside the extract folder, even though a naive
+        # startswith check would pass it.
+        extracted = []
+        real_extract = zipfile.ZipFile.extract
+
+        def recording_extract(self, member, path=None, pwd=None):
+            extracted.append(member.filename)
+            return real_extract(self, member, path, pwd)
+
+        with unittest.mock.patch.object(
+                apis, "sniff_github",
+                return_value={"status": "convert",
+                              "files": ["data.json"],
+                              "total_size": None, "detail": "",
+                              "branch": "main"}), \
+                unittest.mock.patch.object(
+                    apis, "download_file",
+                    side_effect=self._fake_archive_download(
+                        {"tiny-repo-main/data.json": INSTRUCTION_JSON,
+                         "../repo-evil/evil.jsonl": JSONL})), \
+                unittest.mock.patch.object(
+                    zipfile.ZipFile, "extract", recording_extract):
+            report = download.download_and_convert(_gh_item(), self.out)
+        self.assertTrue(report["ok"])
+        self.assertIn("tiny-repo-main/data.json", extracted)
+        self.assertNotIn("../repo-evil/evil.jsonl", extracted)
+
 
 class DirectLinkTests(unittest.TestCase):
     def setUp(self):
@@ -217,7 +338,8 @@ class DirectLinkTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_direct_csv_link_converts(self):
-        def fake_download(url, dest, progress=None, chunk=262144):
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
             Path(dest).write_text(CSV, encoding="utf-8")
             return len(CSV)
 
@@ -229,12 +351,49 @@ class DirectLinkTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["rows"], 2)
 
-    def test_direct_parquet_link_refuses_plainly(self):
+    def test_direct_parquet_link_converts(self):
+        # T62: a direct link to a Parquet file converts when the
+        # reader is installed.
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is not installed")
+        parquet_path = Path(self.tmp.name) / "fixture.parquet"
+        table = pa.Table.from_pylist([
+            {"prompt": "a", "completion": "b"},
+            {"prompt": "c", "completion": "d"},
+        ])
+        pq.write_table(table, parquet_path)
+        blob = parquet_path.read_bytes()
+
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
+            Path(dest).write_bytes(blob)
+            return len(blob)
+
         item = {"title": "Direct Parquet", "source": "Found by hand",
                 "url": "https://example.com/data.parquet"}
-        report = download.download_and_convert(item, self.out)
+        with unittest.mock.patch.object(
+                apis, "download_file", side_effect=fake_download):
+            report = download.download_and_convert(item, self.out)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["rows"], 2)
+
+    def test_direct_parquet_link_without_reader_refuses_plainly(self):
+        # T62: without the reader, the refusal comes before any
+        # download, and names the missing reader.
+        item = {"title": "Direct Parquet", "source": "Found by hand",
+                "url": "https://example.com/data.parquet"}
+        with unittest.mock.patch(
+                "scout.parquet.reader_available",
+                return_value=False), \
+                unittest.mock.patch.object(
+                    apis, "download_file") as fake_download:
+            report = download.download_and_convert(item, self.out)
         self.assertFalse(report["ok"])
-        self.assertIn("only download", report["message"])
+        self.assertIn("Parquet reader", report["message"])
+        fake_download.assert_not_called()
 
 
 class StopTests(unittest.TestCase):
@@ -252,6 +411,147 @@ class StopTests(unittest.TestCase):
                     _hf_item(), Path(tmp), stop=stop)
         self.assertFalse(report["ok"])
         self.assertEqual(report["outputs"], [])
+
+
+class ExperienceTests(unittest.TestCase):
+    """v0.1.3 T26/T27/T28/T34/T43: honest compressed-file messages,
+    resume state kept, mid-file stop, stale-output cleanup."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _hf_download(self, files, sniff_status="ready"):
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
+            Path(dest).write_text(JSONL, encoding="utf-8")
+            return len(JSONL)
+
+        with unittest.mock.patch.object(
+                apis, "sniff_huggingface",
+                return_value={"status": sniff_status, "files": files,
+                              "total_size": 100, "detail": ""}), \
+                unittest.mock.patch.object(
+                    apis, "download_file", side_effect=fake_download):
+            return download.download_and_convert(_hf_item(), self.out)
+
+    def test_gzipped_jsonl_only_names_the_file(self):
+        report = self._hf_download(["train.jsonl.gz"],
+                                   sniff_status="unsupported")
+        self.assertFalse(report["ok"])
+        self.assertIn("No convertible files found", report["message"])
+        self.assertIn("gzipped .jsonl (train.jsonl.gz)",
+                      report["message"])
+
+    def test_direct_gzipped_link_names_the_file(self):
+        item = {"title": "Direct GZ", "source": "Found by hand",
+                "url": "https://example.com/train.jsonl.gz"}
+        report = download.download_and_convert(item, self.out)
+        self.assertFalse(report["ok"])
+        self.assertIn("That link points to a gzipped .jsonl "
+                      "(train.jsonl.gz)", report["message"])
+
+    def test_stale_outputs_are_removed_on_rerun(self):
+        report = self._hf_download(["data/a.jsonl"])
+        self.assertTrue(report["ok"])
+        folder = self.out / download.dataset_folder_name(_hf_item())
+        self.assertTrue((folder / "data-a.jsonl").exists())
+        report = self._hf_download(["data/b.jsonl"])
+        self.assertTrue(report["ok"])
+        self.assertTrue((folder / "data-b.jsonl").exists())
+        self.assertFalse((folder / "data-a.jsonl").exists())
+
+    def test_all_conversions_failing_keeps_state_found(self):
+        # v0.1.3 T43: the fetched files are deleted after the run,
+        # so "downloaded" would be a lie.
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
+            Path(dest).write_text(
+                '{"prompt": "a", "completion": "b"}\n', encoding="utf-8")
+            return 30
+
+        with unittest.mock.patch.object(
+                apis, "sniff_huggingface",
+                return_value={"status": "ready",
+                              "files": ["data/train.jsonl"],
+                              "total_size": 100, "detail": ""}), \
+                unittest.mock.patch.object(
+                    apis, "download_file", side_effect=fake_download):
+            report = download.download_and_convert(_hf_item(), self.out)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["state"], "found")
+
+    def test_source_ids_are_cleaned(self):
+        item = {"title": "x",
+                "url": "https://huggingface.co/datasets/acme/tiny?tab=x"}
+        self.assertEqual(download._hf_dataset_id(item), "acme/tiny")
+        item = {"title": "x",
+                "url": "https://github.com/acme/tiny.git"}
+        self.assertEqual(download._github_repo(item), "acme/tiny")
+
+    def test_download_stopped_reports_plainly(self):
+        # v0.1.3 T28: a stop mid-download ends the run with a plain
+        # message, not an error.
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
+            raise apis.DownloadStopped("stopped")
+
+        with unittest.mock.patch.object(
+                apis, "sniff_huggingface",
+                return_value={"status": "ready",
+                              "files": ["data/train.jsonl"],
+                              "total_size": 100, "detail": ""}), \
+                unittest.mock.patch.object(
+                    apis, "download_file", side_effect=fake_download):
+            report = download.download_and_convert(_hf_item(), self.out)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["state"], "found")
+        self.assertEqual(report["message"], "Stopped part way through.")
+
+    def test_cleanup_keeps_part_files(self):
+        work = Path(self.tmp.name) / "work"
+        (work / "sub").mkdir(parents=True)
+        (work / "sub" / "a.jsonl.part").write_text("half")
+        (work / "sub" / "b.jsonl").write_text("done")
+        (work / "repo.zip").write_text("zip")
+        download._cleanup_work_dir(work)
+        self.assertTrue((work / "sub" / "a.jsonl.part").exists())
+        self.assertFalse((work / "sub" / "b.jsonl").exists())
+        self.assertFalse((work / "repo.zip").exists())
+        self.assertTrue(work.is_dir())
+
+    def test_cleanup_removes_work_dir_without_parts(self):
+        work = Path(self.tmp.name) / "work"
+        (work / "sub").mkdir(parents=True)
+        (work / "sub" / "b.jsonl").write_text("done")
+        download._cleanup_work_dir(work)
+        self.assertFalse(work.exists())
+
+    def test_unknown_with_files_still_downloads(self):
+        # v0.1.3 T26: a failed peek is "unknown", but the file list
+        # is known, so the download is still tried.
+        with unittest.mock.patch.object(
+                apis, "sniff_huggingface",
+                return_value={"status": "unknown",
+                              "files": ["data/train.jsonl"],
+                              "total_size": None,
+                              "detail": "has .jsonl (data/train.jsonl), "
+                                        "shape not checked: could not "
+                                        "read the file"}):
+            def fake_download(url, dest, progress=None, chunk=262144,
+                              limit=None, stop=None):
+                Path(dest).write_text(JSONL, encoding="utf-8")
+                return len(JSONL)
+
+            with unittest.mock.patch.object(
+                    apis, "download_file", side_effect=fake_download):
+                report = download.download_and_convert(
+                    _hf_item(), self.out)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["rows"], 2)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,15 @@ class GithubApiTests(unittest.TestCase):
                 apis.search_github("q", "all")
         self.assertIn("Could not reach the internet", str(ctx.exception))
 
+    def test_search_page_is_passed_to_github(self):
+        # v0.1.3 T22: Load more asks GitHub for the next page.
+        with mock.patch("urllib.request.urlopen",
+                        return_value=FakeResponse({"items": []})) as patched:
+            apis.search_github("q", "all", page=3)
+        request = patched.call_args[0][0]
+        self.assertIn("page=3", request.full_url)
+        self.assertIn("per_page=30", request.full_url)
+
 
 class HfApiTests(unittest.TestCase):
     def test_search_parses_fake_response(self):
@@ -143,6 +152,19 @@ class LinkCheckTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             self.assertEqual(apis.check_link("https://example.com/"), "ok")
         self.assertEqual(calls["n"], 2)
+
+    def test_head_404_falls_back_to_get(self):
+        # v0.1.3 T20: Kaggle answers HEAD 404 on live pages that
+        # GET returns fine.
+        def fake_urlopen(request, timeout=None):
+            if request.method == "HEAD":
+                raise http_error(request.full_url, 404)
+            return FakeResponse(b"x", status=206)
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self.assertEqual(
+                apis.check_link("https://www.kaggle.com/datasets/x"),
+                "ok")
 
     def test_network_error_is_unknown(self):
         with mock.patch("urllib.request.urlopen",
@@ -286,7 +308,9 @@ class SniffTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["branch"], "main")
         self.assertEqual(result["files"], ["data.jsonl"])
-        self.assertEqual(result["total_size"], 510)
+        # v0.1.3 T43: only data files count (README.md's 10 bytes
+        # are not training data).
+        self.assertEqual(result["total_size"], 500)
 
     def test_github_truncated_tree_says_so(self):
         repo = {"default_branch": "main"}
@@ -322,6 +346,106 @@ class SniffTests(unittest.TestCase):
         self.assertEqual(result["status"], "unknown")
         self.assertIn("GitHub and Hugging Face", result["detail"])
 
+    def test_failed_peek_is_unknown_not_convert(self):
+        # v0.1.3 T26: a .jsonl Scout could not read is not a
+        # conversion promise.
+        detail = {"siblings": [{"rfilename": "train.jsonl"}],
+                  "usedStorage": 99}
+        mapping = [
+            ("api/datasets/acme/tiny", FakeResponse(detail)),
+            ("resolve/main/train.jsonl",
+             urllib.error.URLError("down")),
+            ("resolve/master/train.jsonl",
+             urllib.error.URLError("down")),
+        ]
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=self._route(mapping)):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["files"], ["train.jsonl"])
+
+    def test_arrow_only_is_unsupported(self):
+        # v0.1.3 T26: Arrow cannot convert, so it is not "convert".
+        detail = {"siblings": [{"rfilename": "data/train.arrow"}],
+                  "usedStorage": 99}
+        with mock.patch("urllib.request.urlopen",
+                        return_value=FakeResponse(detail)):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "unsupported")
+        self.assertIn("Arrow", result["detail"])
+
+    def test_parquet_only_without_reader_needs_reader(self):
+        detail = {"siblings": [{"rfilename": "data/train.parquet"}],
+                  "usedStorage": 99}
+        with mock.patch("urllib.request.urlopen",
+                        return_value=FakeResponse(detail)), \
+                mock.patch("scout.parquet.reader_available",
+                           return_value=False):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "needs-reader")
+
+    def test_mixed_parquet_arrow_without_reader_needs_reader(self):
+        # v0.1.3 T26: nothing converts, and Parquet is the file a
+        # reader would unlock.
+        detail = {"siblings": [{"rfilename": "data/train.parquet"},
+                               {"rfilename": "data/train.arrow"}],
+                  "usedStorage": 99}
+        with mock.patch("urllib.request.urlopen",
+                        return_value=FakeResponse(detail)), \
+                mock.patch("scout.parquet.reader_available",
+                           return_value=False):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "needs-reader")
+
+    def test_compressed_only_is_unsupported_and_named(self):
+        # v0.1.3 T34: a gzipped .jsonl is named, not denied.
+        detail = {"siblings": [{"rfilename": "train.jsonl.gz"}],
+                  "usedStorage": 99}
+        with mock.patch("urllib.request.urlopen",
+                        return_value=FakeResponse(detail)):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "unsupported")
+        self.assertIn("gzipped .jsonl (train.jsonl.gz)",
+                      result["detail"])
+        self.assertEqual(result["files"], ["train.jsonl.gz"])
+
+    def test_compressed_data_ext(self):
+        self.assertEqual(apis.compressed_data_ext("train.jsonl.gz"),
+                         ".jsonl")
+        self.assertEqual(apis.compressed_data_ext("data.csv.bz2"),
+                         ".csv")
+        self.assertEqual(apis.compressed_data_ext("model.bin.gz"), "")
+        self.assertEqual(apis.compressed_data_ext("train.jsonl"), "")
+
+    def test_dirty_ids_are_cleaned_before_api_use(self):
+        # v0.1.3 T43: a query string or .git suffix never reaches
+        # the API URL.
+        detail = {"siblings": [{"rfilename": "README.md"}],
+                  "usedStorage": 99}
+        with mock.patch("urllib.request.urlopen",
+                        return_value=FakeResponse(detail)) as patched:
+            apis.sniff_huggingface("acme/tiny?tab=readme#files")
+        url = patched.call_args[0][0].full_url
+        self.assertTrue(url.endswith("api/datasets/acme/tiny"))
+        repo = {"default_branch": "main"}
+        tree = {"tree": [], "truncated": False}
+        seen = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request.full_url)
+            if "git/trees/main" in request.full_url:
+                return FakeResponse(tree)
+            return FakeResponse(repo)
+
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=fake_urlopen):
+            result = apis.sniff_github("acme/tiny.git")
+        self.assertEqual(result["status"], "none")
+        # (".git" alone would also match "github.com"; check the
+        # repo segment itself.)
+        self.assertTrue(all("tiny.git" not in url for url in seen))
+        self.assertIn("https://api.github.com/repos/acme/tiny", seen)
+
 
 class DownloadFileTests(unittest.TestCase):
     """T35: streamed download with progress."""
@@ -354,6 +478,120 @@ class DownloadFileTests(unittest.TestCase):
                     apis.download_file("https://example.com/x",
                                        Path(tmp) / "x")
         self.assertIn("404", str(ctx.exception))
+
+    def test_resume_continues_from_part_file(self):
+        # v0.1.3 T27: a .part file is resumed with a Range request,
+        # and the result is the whole file.
+        import tempfile
+        full = b"A" * 100 + b"B" * 100
+        seen = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "f.bin"
+            part = dest.with_name("f.bin.part")
+            part.write_bytes(b"A" * 100)
+
+            def fake_urlopen(request, timeout=None):
+                seen["range"] = request.get_header("Range")
+                return FakeResponse(b"B" * 100, status=206,
+                                    headers={"Content-Length": "100"})
+
+            with mock.patch("urllib.request.urlopen",
+                            side_effect=fake_urlopen):
+                total = apis.download_file("https://example.com/f", dest)
+            self.assertEqual(seen["range"], "bytes=100-")
+            self.assertEqual(total, 200)
+            self.assertEqual(dest.read_bytes(), full)
+            self.assertFalse(part.exists())
+
+    def test_server_ignoring_range_restarts_from_zero(self):
+        # v0.1.3 T27: a 200 to a Range request means the server
+        # ignored it, so the download starts over.
+        import tempfile
+        full = b"A" * 100 + b"B" * 100
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "f.bin"
+            (dest.with_name("f.bin.part")).write_bytes(b"Z" * 50)
+            with mock.patch(
+                    "urllib.request.urlopen",
+                    return_value=FakeResponse(
+                        full, headers={"Content-Length": "200"})):
+                total = apis.download_file("https://example.com/f", dest)
+            self.assertEqual(total, 200)
+            self.assertEqual(dest.read_bytes(), full)
+
+    def test_416_with_matching_part_completes(self):
+        # v0.1.3 T27: the server says the file is exactly the size
+        # already downloaded, so the download is done.
+        import tempfile
+        full = b"A" * 100
+        err = http_error("https://example.com/f", 416,
+                         {"Content-Range": "bytes */100"})
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "f.bin"
+            (dest.with_name("f.bin.part")).write_bytes(full)
+            with mock.patch("urllib.request.urlopen", side_effect=err):
+                total = apis.download_file("https://example.com/f", dest)
+            self.assertEqual(total, 100)
+            self.assertEqual(dest.read_bytes(), full)
+
+    def test_stop_mid_stream_keeps_part_file(self):
+        # v0.1.3 T28: Stop interrupts the file downloading now,
+        # and the partial file stays for the next run.
+        import tempfile
+        import threading
+        stop = threading.Event()
+
+        class SlowResponse(FakeResponse):
+            def read(self, size=-1):
+                stop.set()
+                return b"Q" * 10
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "f.bin"
+            with mock.patch(
+                    "urllib.request.urlopen",
+                    return_value=SlowResponse(
+                        b"", headers={"Content-Length": "200"})):
+                with self.assertRaises(apis.DownloadStopped):
+                    apis.download_file("https://example.com/f", dest,
+                                       stop=stop)
+            self.assertFalse(dest.exists())
+            self.assertTrue(
+                dest.with_name("f.bin.part").exists())
+
+    def test_short_read_keeps_part_file_for_retry(self):
+        # T8 kept, T27 added: a short download is refused, and the
+        # partial file stays so the next run resumes from it.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "f.bin"
+            with mock.patch(
+                    "urllib.request.urlopen",
+                    return_value=FakeResponse(
+                        b"short", headers={"Content-Length": "200"})):
+                with self.assertRaises(apis.SearchError) as ctx:
+                    apis.download_file("https://example.com/f", dest)
+            self.assertIn("part way", str(ctx.exception))
+            self.assertFalse(dest.exists())
+            part = dest.with_name("f.bin.part")
+            self.assertEqual(part.read_bytes(), b"short")
+
+    def test_over_limit_deletes_part_file(self):
+        # T10 kept: a file over the limit is refused, and the
+        # partial file goes, since resuming it is pointless.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "f.bin"
+            with mock.patch(
+                    "urllib.request.urlopen",
+                    return_value=FakeResponse(
+                        b"a" * 200, headers={"Content-Length": "200"})):
+                with self.assertRaises(apis.SearchError) as ctx:
+                    apis.download_file("https://example.com/f", dest,
+                                       limit=100)
+            self.assertIn("bigger", str(ctx.exception))
+            self.assertFalse(dest.exists())
+            self.assertFalse(dest.with_name("f.bin.part").exists())
 
 
 if __name__ == "__main__":

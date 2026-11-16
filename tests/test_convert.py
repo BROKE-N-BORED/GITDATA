@@ -118,6 +118,27 @@ class MapRowTests(unittest.TestCase):
         row, _reason = convert.map_row("just a string")
         self.assertIsNone(row)
 
+    def test_empty_prompt_falls_through_to_instruction(self):
+        # v0.1.3 T30: a broken prompt field no longer vetoes a row
+        # that maps another way.
+        row, _reason = convert.map_row(
+            {"prompt": "", "completion": "",
+             "instruction": "Add", "output": "2"})
+        self.assertEqual(row, {"prompt": "Add", "completion": "2"})
+
+    def test_broken_messages_fall_through_to_instruction(self):
+        row, _reason = convert.map_row(
+            {"messages": "not a list",
+             "instruction": "Add", "output": "2"})
+        self.assertEqual(row, {"prompt": "Add", "completion": "2"})
+
+    def test_empty_prompt_falls_through_to_question(self):
+        row, _reason = convert.map_row(
+            {"prompt": " ", "completion": " ",
+             "question": "What is 2+2?", "answer": "4"})
+        self.assertEqual(row, {"prompt": "What is 2+2?",
+                               "completion": "4"})
+
 
 class ConvertTextTests(unittest.TestCase):
     def test_jsonl_prompt_completion(self):
@@ -191,6 +212,28 @@ class ConvertTextTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["prompt"], "Why?")
 
+    def test_csv_headerless_keeps_its_first_row(self):
+        # v0.1.3 T33: no recognised field name in the first row
+        # means it is data, not a header.
+        text = "What is 2+2?,4\nWhat is 3+3?,6\n"
+        rows, report = convert.convert_csv_text(text)
+        self.assertEqual(report["kept"], 2)
+        self.assertEqual(report["seen"], 2)
+        self.assertEqual(rows[0],
+                         {"prompt": "What is 2+2?", "completion": "4"})
+
+    def test_csv_headerless_tsv_keeps_its_first_row(self):
+        text = "What is 2+2?\t4\nWhat is 3+3?\t6\n"
+        rows, report = convert.convert_csv_text(text, delimiter="\t")
+        self.assertEqual(report["kept"], 2)
+        self.assertEqual(rows[1]["completion"], "6")
+
+    def test_csv_capitalised_headers_map(self):
+        text = "Prompt,Completion\nWhat?,That.\nWho?,Them.\n"
+        rows, report = convert.convert_csv_text(text)
+        self.assertEqual(report["kept"], 2)
+        self.assertEqual(rows[0]["prompt"], "What?")
+
     def test_convert_text_dispatches_by_kind(self):
         text = ('{"prompt": "a", "completion": "b"}\n'
                 '{"prompt": "c", "completion": "d"}\n')
@@ -198,6 +241,13 @@ class ConvertTextTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
 
     def test_convert_text_unknown_kind_raises(self):
+        with self.assertRaises(ValueError):
+            convert.convert_text("a,b\nc,d\n", "xml")
+
+    def test_convert_text_parquet_kind_raises(self):
+        # Parquet is a known kind but not a text kind: it is read
+        # from a file path by scout.parquet (T62), so convert_text
+        # raises for it like any kind it cannot handle.
         with self.assertRaises(ValueError):
             convert.convert_text("a,b\nc,d\n", "parquet")
 

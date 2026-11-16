@@ -12,17 +12,21 @@
     scout-cli import <file>
     scout-cli export <format> <file>     # format: md, json, stella
     scout-cli update-check
+    scout-cli --self-test
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
-from . import apis, core
+from . import apis, core, selftest
 
 
 def _cmd_search(args: argparse.Namespace) -> int:
+    # GitHub takes at most 100 results per page (v0.1.3 T43).
+    limit = max(1, min(args.limit, 100))
     query = core.build_query(args.query, args.category)
     print(f"Searching for: {query}")
     results: list[dict] = []
@@ -30,17 +34,23 @@ def _cmd_search(args: argparse.Namespace) -> int:
     try:
         results = apis.search_github(query, args.category,
                                      token=core.get_github_token(),
-                                     per_page=args.limit)
-    except (apis.SearchError, core.RateLimitedError) as exc:
+                                     per_page=limit)
+    except Exception as exc:  # noqa: BLE001 - one dead source must not kill the search
         core.log_error(f"CLI search failed: {exc}")
         failures.append(("GitHub", str(exc)))
     try:
         results += apis.search_huggingface(query, args.category,
-                                           limit=args.limit)
-    except apis.SearchError as exc:
+                                           limit=limit)
+    except Exception as exc:  # noqa: BLE001 - one dead source must not kill the search
         core.log_error(f"CLI search failed: {exc}")
         failures.append(("Hugging Face", str(exc)))
     if len(failures) == 2:
+        # Both sources failed: say whether the internet itself is
+        # down (T67) instead of blaming the search.
+        if not apis.is_online():
+            print("You are offline. Check the connection and try "
+                  "again.", file=sys.stderr)
+            return 1
         detail = "; ".join(f"{name}: {reason}"
                            for name, reason in failures)
         print(f"Search failed. {detail}", file=sys.stderr)
@@ -52,6 +62,8 @@ def _cmd_search(args: argparse.Namespace) -> int:
         min_stars=args.min_stars,
         license_filter=args.license or "",
     )
+    # Newest first, like the GUI (v0.1.3 T32/T37).
+    results.sort(key=core.updated_sort_key, reverse=True)
     if failures:
         print(f"Note: {failures[0][0]} search did not answer.",
               file=sys.stderr)
@@ -93,8 +105,16 @@ def _cmd_sources(args: argparse.Namespace) -> int:
     return 2
 
 
+def _print_list_notice() -> None:
+    """Say what went wrong loading the list, if anything did (T4)."""
+    notice = core.list_load_notice()
+    if notice:
+        print(notice)
+
+
 def _cmd_list(_args: argparse.Namespace) -> int:
     items = core.load_list()
+    _print_list_notice()
     if not items:
         print("My List is empty.")
         return 0
@@ -147,12 +167,16 @@ def _cmd_remove(args: argparse.Namespace) -> int:
 
 def _cmd_check(_args: argparse.Namespace) -> int:
     items = core.load_list()
+    _print_list_notice()
     if not items:
         print("My List is empty. Nothing to check.")
         return 0
     counts = {"ok": 0, "dead": 0, "unknown": 0}
     for item in items:
-        status = apis.check_link(item["url"])
+        try:
+            status = apis.check_link(item["url"])
+        except Exception:  # noqa: BLE001 - one bad link must not kill the run
+            status = "unknown"
         item["status"] = status
         counts[status] = counts.get(status, 0) + 1
         print(f"- {item['title']}: {status}")
@@ -164,7 +188,8 @@ def _cmd_check(_args: argparse.Namespace) -> int:
 
 def _cmd_import(args: argparse.Namespace) -> int:
     try:
-        with open(args.file, encoding="utf-8") as handle:
+        # utf-8-sig strips a byte-order mark (v0.1.3 T35).
+        with open(args.file, encoding="utf-8-sig") as handle:
             text = handle.read()
     except OSError as exc:
         print(f"Could not read {args.file}: {exc}", file=sys.stderr)
@@ -194,8 +219,9 @@ def _cmd_export(args: argparse.Namespace) -> int:
     else:
         text = core.export_stella_manifest(items)
     try:
-        with open(args.file, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        # Atomic (v0.1.3 T21): a crash mid-write never leaves a
+        # half-written export behind.
+        core.write_text_atomic(Path(args.file), text)
     except OSError as exc:
         print(f"Could not write {args.file}: {exc}", file=sys.stderr)
         return 1
@@ -204,7 +230,10 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 
 def _cmd_update_check(_args: argparse.Namespace) -> int:
-    tag = apis.latest_release_tag()
+    try:
+        tag = apis.latest_release_tag()
+    except Exception:  # noqa: BLE001 - a rate limit must not crash the check
+        tag = None
     if not tag:
         print("Could not reach GitHub to check for updates.")
         return 1
@@ -220,13 +249,18 @@ def build_parser() -> argparse.ArgumentParser:
         prog="scout-cli",
         description="Dataset Scout: find training datasets for STELLA.",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--self-test", action="store_true",
+        help="Check search, sniff, and conversion end to end, "
+             "then report pass or fail.")
+    sub = parser.add_subparsers(dest="command", required=False)
 
     search = sub.add_parser("search", help="Search GitHub and Hugging Face.")
     search.add_argument("query", nargs="?", default="")
     search.add_argument("--category", default="all",
                         choices=list(core.CATEGORIES))
-    search.add_argument("--limit", type=int, default=30)
+    search.add_argument("--limit", type=int, default=30,
+                        help="Results per website (1 to 100).")
     search.add_argument("--min-stars", type=int, default=0)
     search.add_argument("--license", default="",
                         help="Keep only results with this license.")
@@ -274,7 +308,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.self_test:
+        checks = selftest.run_checks()
+        print(selftest.format_report(checks))
+        return 0 if all(check["ok"] for check in checks) else 1
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 2
     return args.func(args)
 
 

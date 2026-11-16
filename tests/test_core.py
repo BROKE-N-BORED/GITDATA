@@ -186,6 +186,17 @@ class HfParseTests(unittest.TestCase):
         self.assertIn("search=math+word+problems", url)
         self.assertIn("limit=30", url)
 
+    def test_license_tag_shows_display_case(self):
+        # v0.1.3 T43: Hugging Face says "mit", GitHub says "MIT".
+        # The column shows one case for both.
+        payload = [{"id": "a/b", "tags": ["license:mit"]},
+                   {"id": "c/d", "tags": ["license:apache-2.0"]},
+                   {"id": "e/f", "tags": ["license:odc-by"]}]
+        items = core.parse_hf_results(payload, "all")
+        self.assertEqual(items[0]["license"], "MIT")
+        self.assertEqual(items[1]["license"], "Apache-2.0")
+        self.assertEqual(items[2]["license"], "odc-by")
+
 
 class SourcesTests(TempHomeMixin, unittest.TestCase):
     def test_defaults_on_first_run(self):
@@ -465,6 +476,23 @@ class NormalizeUrlTests(unittest.TestCase):
             core.normalize_url("https://example.com:443/a"),
             "https://example.com/a")
 
+    def test_http_and_https_are_the_same_link(self):
+        # v0.1.3 T24: the scheme is not part of the identity.
+        self.assertEqual(
+            core.normalize_url("http://example.com/a"),
+            core.normalize_url("https://example.com/a"))
+
+    def test_http_default_port_matches_https(self):
+        self.assertEqual(
+            core.normalize_url("http://example.com:80/a"),
+            core.normalize_url("https://example.com:443/a"))
+
+    def test_bare_host_is_the_root_path(self):
+        # v0.1.3 T24: example.com and example.com/ are one link.
+        self.assertEqual(
+            core.normalize_url("https://example.com"),
+            core.normalize_url("https://example.com/"))
+
     def test_fragment_dropped(self):
         self.assertEqual(
             core.normalize_url("https://example.com/a#section"),
@@ -678,17 +706,87 @@ class HelpersTests(unittest.TestCase):
         self.assertEqual(core.category_key_for_label(""), "all")
 
     def test_parse_version(self):
-        self.assertEqual(core.parse_version("v0.1.2"), (0, 1, 2))
-        self.assertEqual(core.parse_version("1.0"), (1, 0))
+        self.assertEqual(core.parse_version("v0.1.2"), (0, 1, 2, 1))
+        self.assertEqual(core.parse_version("1.0"), (1, 0, 1))
         self.assertEqual(core.parse_version("garbage"), (0,))
         self.assertLess(core.parse_version("v0.1.1"),
                         core.parse_version("v0.1.2"))
+
+    def test_parse_version_prerelease_orders_between_releases(self):
+        # v0.1.3 T43: a prerelease is older than its own release
+        # but newer than the previous release.
+        beta = core.parse_version("v0.1.2-beta")
+        self.assertLess(beta, core.parse_version("v0.1.2"))
+        self.assertGreater(beta, core.parse_version("v0.1.1"))
+        self.assertLess(core.parse_version("v0.1.2-alpha"),
+                        core.parse_version("v0.1.2"))
+
+    def test_parse_version_build_metadata_does_not_change_order(self):
+        self.assertEqual(core.parse_version("v1.0+build"),
+                         core.parse_version("v1.0"))
 
     def test_format_size(self):
         self.assertEqual(core.format_size(500), "500 bytes")
         self.assertEqual(core.format_size(2048), "2.0 KB")
         self.assertEqual(core.format_size(3 * 1024 * 1024), "3.0 MB")
         self.assertEqual(core.format_size("nope"), "")
+
+
+class ExperienceTests(TempHomeMixin, unittest.TestCase):
+    """v0.1.3 T25/T35/T43: description + topics, BOM imports,
+    source-id cleaning, atomic text writes, parsed-time sort."""
+
+    def test_description_and_topics_survive_save_and_reload(self):
+        item = {"title": "A", "url": "https://example.com/a",
+                "description": "A fine dataset.",
+                "topics": ["math", "word-problems"]}
+        core.save_list([core.normalize_item(item)])
+        loaded = core.load_list()
+        self.assertEqual(loaded[0]["description"], "A fine dataset.")
+        self.assertEqual(loaded[0]["topics"], ["math", "word-problems"])
+
+    def test_normalize_item_guards_non_list_topics(self):
+        item = core.normalize_item({"url": "https://example.com/a",
+                                    "topics": "not-a-list"})
+        self.assertEqual(item["topics"], [])
+
+    def test_bom_json_imports(self):
+        text = ('\ufeff{"items": [{"title": "A", '
+                '"url": "https://example.com/a"}]}')
+        items = core.import_file_text(text)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["url"], "https://example.com/a")
+
+    def test_bom_markdown_imports(self):
+        text = ("\ufeff# Dataset Scout list\n\n"
+                "- [A](https://example.com/a)\n")
+        items = core.import_file_text(text)
+        self.assertEqual(len(items), 1)
+
+    def test_clean_source_id(self):
+        self.assertEqual(
+            core.clean_source_id("owner/repo.git?tab=readme#x"),
+            "owner/repo")
+        self.assertEqual(core.clean_source_id("acme/tiny/"), "acme/tiny")
+        self.assertEqual(core.clean_source_id("acme/tiny"), "acme/tiny")
+
+    def test_write_text_atomic_round_trip(self):
+        path = Path(self.tmp.name) / "sub" / "out.jsonl"
+        core.write_text_atomic(path, "hello\n")
+        self.assertEqual(path.read_text(encoding="utf-8"), "hello\n")
+        self.assertEqual(list(path.parent.glob("*.tmp-*")), [])
+
+    def test_updated_sort_key_orders_by_instant_not_string(self):
+        # The audit's pair: +12:00 sorts after Z as a raw string,
+        # but it is the earlier instant.
+        later = {"updated": "2026-01-01T00:00:00Z"}
+        earlier = {"updated": "2026-01-01T00:00:00+12:00"}
+        self.assertLess(core.updated_sort_key(earlier),
+                        core.updated_sort_key(later))
+        items = [earlier, later, {"updated": "garbage"}]
+        items.sort(key=core.updated_sort_key, reverse=True)
+        self.assertEqual(items[0], later)
+        self.assertEqual(items[-1], {"updated": "garbage"})
 
 
 if __name__ == "__main__":

@@ -33,7 +33,9 @@ APP = None
 def get_app():
     global APP
     if APP is None:
-        APP = QApplication([])
+        # Reuse the singleton when another test module already
+        # made it: a second QApplication raises (libshiboken).
+        APP = QApplication.instance() or QApplication([])
     return APP
 
 
@@ -208,14 +210,23 @@ class SourcesTabTests(GuiTestCase):
         self.window.add_source()
         self.assertEqual(self.window.sources_table.rowCount(), 3)
         self.assertEqual(len(core.load_sources()), 3)
-        self.window.remove_source("Example Site")
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.window.remove_source("Example Site")
         self.assertEqual(self.window.sources_table.rowCount(), 2)
         self.assertEqual(len(core.load_sources()), 2)
 
     def test_restore_defaults(self):
-        self.window.remove_source("Kaggle Datasets")
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.window.remove_source("Kaggle Datasets")
         self.assertEqual(self.window.sources_table.rowCount(), 1)
-        self.window.restore_sources()
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.window.restore_sources()
         self.assertEqual(self.window.sources_table.rowCount(), 2)
 
     def test_refresh_never_doubles_the_remove_buttons(self):
@@ -225,7 +236,10 @@ class SourcesTabTests(GuiTestCase):
         self.window.site_name.setText("Example Site")
         self.window.site_url.setText("https://example.com/?q={q}")
         self.window.add_source()
-        self.window.remove_source("Example Site")
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.window.remove_source("Example Site")
         # Spin the real event loop: one processEvents() call does NOT
         # flush deleteLater() deletions in this PySide6 build (proven
         # by probe 2026-11-13 — count stayed 10 after processEvents,
@@ -257,6 +271,7 @@ class ListTabTests(GuiTestCase):
             "category": "reasoning", "source": "GitHub",
             "stars": 5, "updated": "", "license": "", "notes": ""})]
         core.save_list(self.window.my_list)
+        self.window._note_list_loaded()
         self.window._refresh_list_tab()
 
     def test_remove_selected(self):
@@ -488,6 +503,7 @@ class BusyDotTests(GuiTestCase):
             "category": "reasoning", "source": "GitHub",
             "stars": 5, "updated": "", "license": "", "notes": ""})]
         core.save_list(self.window.my_list)
+        self.window._note_list_loaded()
         self.window._refresh_list_tab()
         release = threading.Event()
 
@@ -521,6 +537,7 @@ class LinkCheckStopTests(GuiTestCase):
             "stars": 5, "updated": "", "license": "", "notes": ""})
             for n in range(8)]
         core.save_list(self.window.my_list)
+        self.window._note_list_loaded()
         self.window._refresh_list_tab()
 
     def _wait_for_check_button(self, timeout_ms=5000):
@@ -848,6 +865,7 @@ class UndoTests(GuiTestCase):
             "stars": 5, "updated": "", "license": "", "notes": ""})
             for title in ("A", "B")]
         core.save_list(self.window.my_list)
+        self.window._note_list_loaded()
         self.window._refresh_list_tab()
 
     def _remove_row(self, row):
@@ -899,6 +917,7 @@ class EditDialogTests(GuiTestCase):
             "category": "reasoning", "source": "GitHub",
             "stars": 5, "updated": "", "license": "", "notes": ""})]
         core.save_list(self.window.my_list)
+        self.window._note_list_loaded()
         self.window._refresh_list_tab()
         self.window.list_table.selectRow(0)
         fake = unittest.mock.Mock()
@@ -987,6 +1006,7 @@ class ReorderTests(GuiTestCase):
             "stars": 5, "updated": "", "license": "", "notes": ""})
             for title in ("A", "B", "C")]
         core.save_list(self.window.my_list)
+        self.window._note_list_loaded()
         self.window._refresh_list_tab()
 
     def _titles(self):
@@ -1014,6 +1034,275 @@ class ReorderTests(GuiTestCase):
         self.assertEqual(
             [item["title"] for item in core.load_list()],
             ["B", "C", "A"])
+
+
+class SearchButtonsDisabledTests(GuiTestCase):
+    """v0.1.3 T17: Add and Check wait while a search runs."""
+
+    def test_add_buttons_disabled_during_search(self):
+        def slow_github(*args, **kwargs):
+            time.sleep(1)
+            return []
+
+        with unittest.mock.patch.object(
+                apis, "search_github", side_effect=slow_github), \
+                unittest.mock.patch.object(
+                    apis, "search_huggingface", return_value=[]):
+            self.window.search_box.setCurrentText("math")
+            self.window.start_search()
+            self.assertFalse(
+                self.window.add_selected_button.isEnabled())
+            self.assertFalse(self.window.add_all_button.isEnabled())
+            self.assertFalse(
+                self.window.stella_check_button.isEnabled())
+            deadline = 100
+            while (not self.window.search_button.isEnabled()
+                   and deadline > 0):
+                QTest.qWait(50)
+                deadline -= 1
+            self.assertTrue(self.window.search_button.isEnabled())
+        self.assertTrue(self.window.add_selected_button.isEnabled())
+        self.assertTrue(self.window.add_all_button.isEnabled())
+        self.assertTrue(self.window.stella_check_button.isEnabled())
+
+
+class StellaCheckStopTests(GuiTestCase):
+    """v0.1.3 T18: the STELLA check shows progress and offers Stop."""
+
+    def setUp(self):
+        super().setUp()
+        results = [core.normalize_item({
+            "title": f"Item {n}",
+            "url": f"https://example.com/{n}",
+            "category": "reasoning", "source": "GitHub",
+            "stars": 5, "updated": "2026-11-01T00:00:00Z",
+            "license": "", "notes": ""}) for n in range(4)]
+        self.window._search_done(results)
+        self.window.results_table.selectAll()
+
+    def test_stop_button_and_count(self):
+        def slow_sniff(item, token=""):
+            time.sleep(0.2)
+            return {"status": "ready", "files": ["train.jsonl"],
+                    "total_size": 10, "detail": "ok"}
+
+        with unittest.mock.patch.object(
+                apis, "sniff_item", side_effect=slow_sniff):
+            self.window.start_stella_check("results")
+            self.assertTrue(
+                self.window.stop_stella_button.isEnabled())
+            self.assertTrue(
+                self.window.list_stop_stella_button.isEnabled())
+            self.assertEqual(self.window.statusBar().currentMessage(),
+                             "Checking 0 of 4...")
+            deadline = 100
+            while (self.window._stella_done_count < 1
+                   and deadline > 0):
+                QTest.qWait(50)
+                deadline -= 1
+            self.assertGreaterEqual(self.window._stella_done_count, 1)
+            self.assertEqual(self.window.statusBar().currentMessage(),
+                             f"Checking "
+                             f"{self.window._stella_done_count} of 4...")
+            self.window.stop_stella_check()
+            deadline = 100
+            while (not self.window.stella_check_button.isEnabled()
+                   and deadline > 0):
+                QTest.qWait(50)
+                deadline -= 1
+            self.assertTrue(self.window.stella_check_button.isEnabled())
+        checked = self.window._stella_done_count
+        self.assertGreaterEqual(checked, 1)
+        self.assertLess(checked, 4)
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         f"Stopped, {checked} of 4 checked.")
+        self.assertFalse(self.window.stop_stella_button.isEnabled())
+        self.assertFalse(
+            self.window.list_stop_stella_button.isEnabled())
+
+
+class SourcesConfirmTests(GuiTestCase):
+    """v0.1.3 T19: removing or restoring websites asks first."""
+
+    def test_remove_cancelled_keeps_the_site(self):
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.No):
+            self.window.remove_source("Kaggle Datasets")
+        self.assertEqual(len(core.load_sources()), 2)
+        self.assertFalse(self.window.undo_site_button.isEnabled())
+
+    def test_undo_restores_removed_site_in_place(self):
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.window.remove_source("Hugging Face Datasets")
+        self.assertEqual([s["name"] for s in core.load_sources()],
+                         ["Kaggle Datasets"])
+        self.assertTrue(self.window.undo_site_button.isEnabled())
+        self.window.undo_remove_source()
+        self.assertEqual([s["name"] for s in core.load_sources()],
+                         ["Hugging Face Datasets", "Kaggle Datasets"])
+        self.assertFalse(self.window.undo_site_button.isEnabled())
+
+    def test_restore_cancelled_keeps_custom_sites(self):
+        self.window.site_name.setText("Example Site")
+        self.window.site_url.setText("https://example.com/?q={q}")
+        self.window.add_source()
+        self.assertEqual(len(core.load_sources()), 3)
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.No):
+            self.window.restore_sources()
+        self.assertEqual(len(core.load_sources()), 3)
+
+
+class LoadMoreTests(GuiTestCase):
+    """v0.1.3 T22: Load more appends the next page."""
+
+    def _results(self, titles):
+        return [core.normalize_item({
+            "title": title, "url": f"https://example.com/{title}",
+            "category": "reasoning", "source": "GitHub",
+            "stars": 5, "updated": "2026-11-01T00:00:00Z",
+            "license": "", "notes": ""}) for title in titles]
+
+    def test_load_more_appends_and_dedups(self):
+        self.window._search_done(self._results(["A", "B"]))
+        self.assertEqual(self.window.results_table.rowCount(), 2)
+        self.assertTrue(self.window.load_more_button.isEnabled())
+        # Page 2 repeats A and adds C.
+        self.window._load_more_done(self._results(["A", "C"]))
+        titles = [self.window.results_table.item(row, 0).text()
+                  for row in range(self.window.results_table.rowCount())]
+        self.assertEqual(sorted(titles), ["A", "B", "C"])
+        self.assertTrue(self.window.load_more_button.isEnabled())
+        self.assertIn("Loaded 1 more result",
+                      self.window.statusBar().currentMessage())
+
+    def test_load_more_with_nothing_new_says_so(self):
+        self.window._search_done(self._results(["A"]))
+        self.window._load_more_done(self._results(["A"]))
+        self.assertEqual(self.window.results_table.rowCount(), 1)
+        self.assertFalse(self.window.load_more_button.isEnabled())
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "No more results.")
+
+
+class EditDialogCategoryTests(GuiTestCase):
+    """v0.1.3 T31/T43: an untouched save keeps category and state."""
+
+    def _dialog(self, **fields):
+        item = core.normalize_item(
+            {"title": "A", "url": "https://example.com/a", **fields})
+        dialog = EditItemDialog(item, self.window)
+        self.addCleanup(dialog.close)
+        return dialog
+
+    def test_custom_category_survives_untouched_save(self):
+        dialog = self._dialog(category="my_cat")
+        self.assertEqual(dialog.values()["category"], "my_cat")
+
+    def test_mixed_case_category_survives_untouched_save(self):
+        dialog = self._dialog(category="MyCat")
+        self.assertEqual(dialog.values()["category"], "MyCat")
+
+    def test_changing_the_category_still_works(self):
+        dialog = self._dialog(category="my_cat")
+        dialog.category_field.setCurrentText("Reasoning")
+        self.assertEqual(dialog.values()["category"], "reasoning")
+
+    def test_unknown_state_is_kept_not_reset(self):
+        dialog = self._dialog(state="waiting-review")
+        self.assertEqual(dialog.values()["state"], "waiting-review")
+
+
+class RenameCollectionTests(GuiTestCase):
+    """v0.1.3 T36: renaming saves the active list first."""
+
+    def test_rename_keeps_in_memory_changes(self):
+        self.window.my_list = [core.normalize_item({
+            "title": "A", "url": "https://example.com/a"})]
+        core.save_list(self.window.my_list)
+        # An in-memory-only change: the status was never saved.
+        self.window.my_list[0]["status"] = "ok"
+        with unittest.mock.patch.object(
+                QInputDialog, "getText",
+                return_value=("Renamed", True)):
+            self.window.rename_collection()
+        _active, names = core.load_collections()
+        self.assertIn("Renamed", names)
+        self.assertEqual(core.load_list()[0]["status"], "ok")
+
+
+class TimezoneSortTests(GuiTestCase):
+    """v0.1.3 T37: newest first means newest instant, not string."""
+
+    def test_timezone_offsets_do_not_misorder(self):
+        results = [
+            {"title": "old", "url": "https://example.com/old",
+             "category": "reasoning", "source": "GitHub", "stars": 5,
+             "updated": "2026-01-01T00:00:00+12:00",
+             "description": "", "license": ""},
+            {"title": "new", "url": "https://example.com/new",
+             "category": "reasoning", "source": "GitHub", "stars": 5,
+             "updated": "2025-12-31T13:00:00Z",
+             "description": "", "license": ""},
+        ]
+        self.window.active_check.setChecked(False)
+        self.window._search_done(results)
+        titles = [self.window.results_table.item(row, 0).text()
+                  for row in range(self.window.results_table.rowCount())]
+        self.assertEqual(titles, ["new", "old"])
+
+
+class FieldExplanationTests(GuiTestCase):
+    """v0.1.3 T39: every field explains itself underneath."""
+
+    def test_list_tab_explanations_are_present(self):
+        labels = [child.text()
+                  for child in self.window.findChildren(QLabel)]
+        self.assertIn("Lists keep your links grouped. Switch lists, "
+                      "make a new one, rename it, or delete it.",
+                      labels)
+        self.assertIn("Type to narrow this list by title or link. "
+                      "State keeps only links in one step of the "
+                      "pipeline.", labels)
+        self.assertIn("Export saves this list as a file. Import reads "
+                      "one back in. Send to STELLA writes the manifest "
+                      "where STELLA can find it.", labels)
+
+    def test_edit_dialog_explanations_are_present(self):
+        item = core.normalize_item(
+            {"title": "A", "url": "https://example.com/a"})
+        dialog = EditItemDialog(item, self.window)
+        self.addCleanup(dialog.close)
+        labels = [child.text() for child in dialog.findChildren(QLabel)]
+        self.assertIn("The name shown in My List.", labels)
+        self.assertIn("Pick one, or type your own category.", labels)
+        self.assertIn("Anything to remember about it.", labels)
+        self.assertIn("Where this link is in the pipeline: found, "
+                      "downloaded, converted, or in STELLA.", labels)
+
+
+class EmptySearchMessageTests(GuiTestCase):
+    """v0.1.3 T41: no results means no 'Pick rows' suffix."""
+
+    def test_empty_search_has_no_pick_rows_suffix(self):
+        self.window._search_done([])
+        self.assertEqual(self.window.results_table.rowCount(), 0)
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Found 0 results.")
+
+    def test_results_still_get_the_pick_rows_suffix(self):
+        results = [core.normalize_item({
+            "title": "A", "url": "https://example.com/a",
+            "category": "reasoning", "source": "GitHub",
+            "stars": 5, "updated": "2026-11-01T00:00:00Z",
+            "license": "", "notes": ""})]
+        self.window._search_done(results)
+        self.assertIn("Pick rows and add them to My List.",
+                      self.window.statusBar().currentMessage())
 
 
 if __name__ == "__main__":

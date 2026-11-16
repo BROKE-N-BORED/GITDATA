@@ -18,11 +18,12 @@ import os
 import re
 import shutil
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus, urlsplit, urlunsplit
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 APP_NAME = "Dataset Scout"
 
@@ -59,19 +60,58 @@ def _write_json_atomic(path: Path, payload: dict,
                        backup: bool = False) -> None:
     """Write JSON via a tmp file + replace, so a crash mid-write
     never leaves a half-written file (T2). With backup=True the
-    previous file is kept as <name>.bak first."""
+    previous file is kept as <name>.bak first, but only when the
+    previous file still parses: a corrupt file must never overwrite
+    the good backup (v0.1.3 T4). The tmp name is unique per save,
+    so two simultaneous saves cannot interleave into one temp file
+    (v0.1.3 T13)."""
     ensure_home()
     if backup and path.is_file():
         try:
-            shutil.copyfile(path, path.with_name(path.name + ".bak"))
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass  # corrupt current file: leave the old backup alone
+        else:
+            try:
+                shutil.copyfile(path, path.with_name(path.name + ".bak"))
+            except OSError:
+                pass
+    tmp = path.with_name(
+        f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    try:
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
         except OSError:
             pass
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    os.replace(tmp, path)
+        raise
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write text via a tmp file + replace (v0.1.3 T21).
+
+    The same crash safety as _write_json_atomic, for converted
+    .jsonl files, exports, and the STELLA manifest: a crash
+    mid-write never leaves a half-written file behind. Parent
+    folders are created; a failed write removes the tmp file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(
+        f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # STELLA-ready check results (T29). "" means not checked yet.
@@ -81,6 +121,14 @@ STELLA_STATUS_LABELS = {
     "convert": "Needs conversion",
     "none": "No data files",
     "unknown": "Check failed",
+    # Parquet-only, and the optional Parquet reader is not
+    # installed (T62): the check itself worked, the reader is
+    # what is missing.
+    "needs-reader": "Reader not installed",
+    # Data files Scout cannot convert at all (Arrow-only,
+    # compressed-only): the check worked, conversion is the
+    # missing part (v0.1.3 T26/T34).
+    "unsupported": "Cannot convert",
 }
 
 # Workflow states for a saved link (T30).
@@ -138,12 +186,24 @@ def category_key_for_label(text: str) -> str:
 
 
 def parse_version(tag: str) -> tuple:
-    """A release tag ("v0.1.2") as a comparable tuple (T21)."""
+    """A release tag ("v0.1.2") as a comparable tuple (T21).
+
+    A release sorts after its own prereleases but before the
+    next release: "v0.1.2-beta" is older than "v0.1.2" and newer
+    than "v0.1.1" (v0.1.3 T43). The last element marks that:
+    1 for a release, 0 for a prerelease. Build metadata after
+    "+" does not change the order.
+    """
+    text = str(tag).lstrip("v")
+    prerelease = "-" in text
+    for marker in ("-", "+"):
+        if marker in text:
+            text = text.split(marker, 1)[0]
     try:
-        return tuple(int(part)
-                     for part in str(tag).lstrip("v").split("."))
+        parts = tuple(int(part) for part in text.split("."))
     except ValueError:
         return (0,)
+    return parts + ((0,) if prerelease else (1,))
 
 
 def format_size(num_bytes) -> str:
@@ -191,8 +251,12 @@ def build_query(text: str, category: str) -> str:
 # ---------------------------------------------------------------- dates
 
 def parse_iso_date(value: str | None) -> datetime | None:
-    """Parse an ISO-8601 date (GitHub/HF style) to an aware datetime."""
-    if not value:
+    """Parse an ISO-8601 date (GitHub/HF style) to an aware datetime.
+
+    Anything that is not a string (a damaged cache or list file can
+    hold a number here) is not a date: None, never an exception.
+    """
+    if not isinstance(value, str) or not value:
         return None
     text = value.strip()
     try:
@@ -204,6 +268,17 @@ def parse_iso_date(value: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def updated_sort_key(item: dict):
+    """Newest-first sort key from the parsed updated time.
+
+    Raw date strings misorder across timezones ("+12:00" sorts
+    after "Z" for the same instant); the parsed time does not
+    (v0.1.3 T37). An unparseable date sorts last.
+    """
+    parsed = parse_iso_date(item.get("updated"))
+    return parsed or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def is_active(updated: str | None, months: int | None,
@@ -235,11 +310,13 @@ def format_date(value: str | None) -> str:
 GITHUB_SEARCH_URL = "https://api.github.com/search/repositories"
 
 
-def github_search_url(query: str, per_page: int = 30) -> str:
+def github_search_url(query: str, per_page: int = 30,
+                      page: int = 1) -> str:
     params = (
         f"q={quote_plus(query)}"
         "&sort=stars&order=desc"
         f"&per_page={per_page}"
+        f"&page={page}"
     )
     return f"{GITHUB_SEARCH_URL}?{params}"
 
@@ -253,23 +330,43 @@ class RateLimitedError(Exception):
             msg = (
                 "GitHub search limit reached. Try again after "
                 f"{when}, or add a GitHub token in the Sources tab "
-                "for more searches per hour."
+                "for more searches per minute."
             )
         else:
             msg = (
                 "GitHub search limit reached. Wait a little while, "
                 "or add a GitHub token in the Sources tab for more "
-                "searches per hour."
+                "searches per minute."
             )
         super().__init__(msg)
         self.reset_at = reset_at
 
 
 def parse_github_results(payload: dict, category: str) -> list[dict]:
-    """Turn a GitHub search response into Scout result dicts."""
+    """Turn a GitHub search response into Scout result dicts.
+
+    Malformed rows are skipped, never fatal: a payload with a
+    non-list `items`, a non-dict row, or a string `license` must
+    not raise (v0.1.3 T7).
+    """
     results = []
-    for item in payload.get("items", []) or []:
+    items = payload.get("items", []) or []
+    if not isinstance(items, list):
+        return results
+    for item in items:
+        if not isinstance(item, dict):
+            continue
         license_info = item.get("license") or {}
+        if isinstance(license_info, dict):
+            license_text = (license_info.get("spdx_id")
+                            or license_info.get("name") or "")
+        elif isinstance(license_info, str):
+            license_text = license_info
+        else:
+            license_text = ""
+        topics = item.get("topics") or []
+        if not isinstance(topics, list):
+            topics = []
         results.append({
             "title": item.get("full_name") or item.get("name") or "",
             "url": item.get("html_url") or "",
@@ -278,8 +375,8 @@ def parse_github_results(payload: dict, category: str) -> list[dict]:
             "stars": item.get("stargazers_count") or 0,
             "updated": item.get("pushed_at") or item.get("updated_at") or "",
             "description": item.get("description") or "",
-            "license": license_info.get("spdx_id") or license_info.get("name") or "",
-            "topics": list(item.get("topics") or []),
+            "license": license_text,
+            "topics": list(topics),
             "downloads": 0,
             "format": "",
             "size_category": "",
@@ -305,6 +402,29 @@ def _tag_value(tags: list, prefix: str) -> str:
     return ""
 
 
+# Hugging Face license tags are lowercase ("mit"); GitHub shows
+# the SPDX display case ("MIT"). Show the same case for both, so
+# the license column and the license filter agree (v0.1.3 T43).
+_LICENSE_DISPLAY = {
+    "mit": "MIT",
+    "apache-2.0": "Apache-2.0",
+    "bsd-2-clause": "BSD-2-Clause",
+    "bsd-3-clause": "BSD-3-Clause",
+    "cc0-1.0": "CC0-1.0",
+    "cc-by-4.0": "CC-BY-4.0",
+    "cc-by-sa-4.0": "CC-BY-SA-4.0",
+    "gpl-3.0": "GPL-3.0",
+    "lgpl-3.0": "LGPL-3.0",
+    "mpl-2.0": "MPL-2.0",
+    "unlicense": "Unlicense",
+}
+
+
+def _display_license(value: str) -> str:
+    """A license tag in its display case, or as-is if unknown."""
+    return _LICENSE_DISPLAY.get((value or "").lower(), value or "")
+
+
 def parse_hf_results(payload: list, category: str) -> list[dict]:
     """Turn a Hugging Face datasets response into Scout result dicts.
 
@@ -314,8 +434,12 @@ def parse_hf_results(payload: list, category: str) -> list[dict]:
     """
     results = []
     for item in payload or []:
-        dataset_id = item.get("id") or ""
-        tags = list(item.get("tags") or [])
+        if not isinstance(item, dict):
+            continue
+        dataset_id = str(item.get("id") or "")
+        tags = item.get("tags") or []
+        if not isinstance(tags, list):
+            tags = []
         results.append({
             "title": dataset_id,
             "url": f"https://huggingface.co/datasets/{dataset_id}" if dataset_id else "",
@@ -324,8 +448,8 @@ def parse_hf_results(payload: list, category: str) -> list[dict]:
             "stars": item.get("likes") or 0,
             "updated": item.get("lastModified") or "",
             "description": "",
-            "license": _tag_value(tags, "license:"),
-            "topics": tags,
+            "license": _display_license(_tag_value(tags, "license:")),
+            "topics": list(tags),
             "downloads": item.get("downloads") or 0,
             "format": _tag_value(tags, "format:"),
             "size_category": _tag_value(tags, "size_categories:"),
@@ -345,6 +469,8 @@ def filter_results(results: list[dict], active_only: bool,
     kept = []
     wanted = (license_filter or "").strip().lower()
     for item in results:
+        if not isinstance(item, dict):
+            continue  # a damaged cache row is skipped, never fatal
         if _safe_int(item.get("stars")) < min_stars:
             continue
         if wanted:
@@ -467,6 +593,45 @@ def list_path() -> Path:
     return home_dir() / "mylist.json"
 
 
+# Plain-words notes from the last list load: a corrupt file that
+# was recovered from the backup, rows dropped while loading (T4).
+# Consecutive duplicates collapse (the file is read several times
+# at startup); list_load_notice() consumes them.
+_LIST_LOAD_NOTES: list[str] = []
+
+
+def _note_list_load(text: str) -> None:
+    if not _LIST_LOAD_NOTES or _LIST_LOAD_NOTES[-1] != text:
+        _LIST_LOAD_NOTES.append(text)
+
+
+def list_load_notice() -> str:
+    """What went wrong loading the list, in plain words, or "".
+
+    Consumes the notes: each notice is reported once.
+    """
+    notes = list(_LIST_LOAD_NOTES)
+    del _LIST_LOAD_NOTES[:]
+    return " ".join(notes)
+
+
+class ListChangedError(Exception):
+    """The list file changed on disk since it was last read (T13)."""
+
+
+def list_generation() -> str:
+    """A fingerprint of the saved list file ("" when there is none).
+
+    Two reads with the same fingerprint saw the same file; a
+    different fingerprint means something else saved since.
+    """
+    path = list_path()
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
 def _migrate_list_data(data) -> dict:
     """Accept the old {"items": [...]} shape or the collections
     shape; always return {"active": name, "collections": [...]}."""
@@ -498,25 +663,70 @@ def _migrate_list_data(data) -> dict:
 
 
 def _read_list_file() -> dict:
-    """The saved list file, migrated to collections shape (T30)."""
+    """The saved list file, migrated to collections shape (T30).
+
+    When the file is corrupt, the .bak backup is loaded instead
+    (T4): the backup exists precisely for this, and the first save
+    after corruption must not destroy it (see _write_json_atomic).
+    The user is told through list_load_notice().
+    """
     path = list_path()
     if not path.is_file():
         return _migrate_list_data(None)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        bak = path.with_name(path.name + ".bak")
+        if bak.is_file():
+            try:
+                bak_data = json.loads(bak.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                bak_data = None
+            if bak_data is not None:
+                recovered = _migrate_list_data(bak_data)
+                count = sum(len(col["items"])
+                            for col in recovered["collections"])
+                word = "link" if count == 1 else "links"
+                note = ("The saved list was damaged, so Dataset Scout "
+                        f"loaded the backup copy instead ({count} {word} "
+                        "recovered).")
+                _note_list_load(note)
+                log(note, level="WARNING")
+                return recovered
+        note = ("The saved list was damaged and could not be read, "
+                "so Dataset Scout started with an empty list.")
+        _note_list_load(note)
+        log(note, level="WARNING")
         return _migrate_list_data(None)
     return _migrate_list_data(data)
 
 
 def _clean_items(items) -> list[dict]:
     out = []
+    dropped = 0
     for item in items or []:
-        if isinstance(item, dict) and item.get("url"):
-            try:
-                out.append(normalize_item(item))
-            except Exception as exc:  # noqa: BLE001 - one bad row must not lose the list
-                log(f"Skipping a bad row in My List: {exc}", level="WARNING")
+        if not isinstance(item, dict):
+            dropped += 1
+            log("Skipping a saved row that is not a link entry.",
+                level="WARNING")
+            continue
+        if not item.get("url"):
+            dropped += 1
+            log("Skipping a saved row with no link.",
+                level="WARNING")
+            continue
+        try:
+            out.append(normalize_item(item))
+        except Exception as exc:  # noqa: BLE001 - one bad row must not lose the list
+            dropped += 1
+            log(f"Skipping a bad row in My List: {exc}", level="WARNING")
+    if dropped:
+        if dropped == 1:
+            note = ("1 saved row could not be read and was left out.")
+        else:
+            note = (f"{dropped} saved rows could not be read and were "
+                    "left out.")
+        _note_list_load(note)
     return out
 
 
@@ -540,18 +750,33 @@ def load_list() -> list[dict]:
     return []
 
 
-def save_list(items: list[dict]) -> None:
-    """Save items into the active collection, keeping the others."""
+def save_list(items: list[dict],
+              expected_generation: str | None = None) -> None:
+    """Save items into the active collection, keeping the others.
+
+    With expected_generation set, the save refuses (ListChangedError)
+    when the file changed on disk since the caller last read it, so
+    a GUI save cannot silently clobber changes made via the CLI
+    while the GUI was open (T13). The caller then merges and retries.
+    """
     data = _read_list_file()
     for col in data["collections"]:
         if col["name"] == data["active"]:
             col["items"] = [normalize_item(item) for item in items]
             break
+    if (expected_generation is not None
+            and list_generation() != expected_generation):
+        raise ListChangedError(
+            "The list changed on disk since it was last read.")
     _write_json_atomic(list_path(), data, backup=True)
 
 
-def save_collections(active: str, collections: list[dict]) -> None:
-    """Save the full collections file."""
+def save_collections(active: str, collections: list[dict],
+                     expected_generation: str | None = None) -> None:
+    """Save the full collections file.
+
+    expected_generation works as in save_list (T13).
+    """
     data = {
         "active": active,
         "collections": [
@@ -561,6 +786,10 @@ def save_collections(active: str, collections: list[dict]) -> None:
             for col in collections
         ],
     }
+    if (expected_generation is not None
+            and list_generation() != expected_generation):
+        raise ListChangedError(
+            "The list changed on disk since it was last read.")
     _write_json_atomic(list_path(), data, backup=True)
 
 
@@ -578,6 +807,9 @@ def normalize_item(item: dict) -> dict:
     files = item.get("stella_files") or []
     if not isinstance(files, list):
         files = []
+    topics = item.get("topics") or []
+    if not isinstance(topics, list):
+        topics = []
     return {
         "title": str(item.get("title") or item.get("url") or ""),
         "url": str(item.get("url") or ""),
@@ -585,12 +817,14 @@ def normalize_item(item: dict) -> dict:
         "source": str(item.get("source") or ""),
         "stars": _safe_int(item.get("stars") or 0),
         "updated": str(item.get("updated") or ""),
+        "description": str(item.get("description") or ""),
         "license": str(item.get("license") or ""),
         "notes": str(item.get("notes") or ""),
         "status": str(item.get("status") or ""),
         "downloads": _safe_int(item.get("downloads") or 0),
         "format": str(item.get("format") or ""),
         "size_category": str(item.get("size_category") or ""),
+        "topics": [str(entry) for entry in topics],
         "stella_status": str(item.get("stella_status") or ""),
         "stella_files": [str(entry) for entry in files],
         "stella_size": _safe_int(item.get("stella_size") or 0),
@@ -602,8 +836,10 @@ def normalize_url(url: str) -> str:
     """Canonical form of a URL, for dedup only (T7).
 
     Lowercase scheme and host, drop default ports and a leading
-    www., strip a trailing slash and the fragment. The stored URL
-    keeps its original shape; only comparisons use this form.
+    www., strip a trailing slash and the fragment. http and https
+    are the same link, and a bare host is the root path, so both
+    collapse (v0.1.3 T24). The stored URL keeps its original
+    shape; only comparisons use this form.
     """
     text = (url or "").strip()
     if not text:
@@ -615,6 +851,8 @@ def normalize_url(url: str) -> str:
     except ValueError:
         return text
     scheme = parsed.scheme.lower()
+    if scheme in ("http", "https"):
+        scheme = "https"
     host = (parsed.hostname or "").lower()
     if host.startswith("www."):
         host = host[4:]
@@ -622,8 +860,9 @@ def normalize_url(url: str) -> str:
         port = parsed.port
     except ValueError:
         port = None
-    if (scheme == "http" and port == 80) or \
-            (scheme == "https" and port == 443):
+    # http and https are the same link now, so both default
+    # ports collapse (T24).
+    if scheme == "https" and port in (80, 443):
         port = None
     netloc = host
     if port:
@@ -634,9 +873,29 @@ def normalize_url(url: str) -> str:
             auth += f":{parsed.password}"
         netloc = f"{auth}@{netloc}"
     path = parsed.path or ""
+    if path == "/":
+        path = ""
     if len(path) > 1 and path.endswith("/"):
         path = path.rstrip("/")
     return urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+
+def clean_source_id(text: str) -> str:
+    """A dataset id or repo path cleaned for API use (v0.1.3 T43).
+
+    Strips a query string, a fragment, trailing slashes, and a
+    ".git" suffix: "owner/repo.git?tab=readme" becomes
+    "owner/repo". An id copied from a browser address bar is
+    often dirty this way.
+    """
+    cleaned = (text or "").strip()
+    for marker in ("?", "#"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[0]
+    cleaned = cleaned.rstrip("/")
+    if cleaned.lower().endswith(".git"):
+        cleaned = cleaned[:-4]
+    return cleaned
 
 
 def add_to_list(items: list[dict], new_item: dict) -> tuple[list[dict], bool]:
@@ -803,15 +1062,17 @@ def import_markdown_text(text: str) -> list[dict]:
 
 def import_file_text(text: str) -> list[dict]:
     """Import from export text: JSON when it parses as JSON, else
-    Markdown. Raises ValueError with a plain message when the text
-    holds no usable list."""
-    stripped = text.strip()
+    Markdown. A byte-order mark at the start is stripped first,
+    so a BOM does not break the JSON check (v0.1.3 T35). Raises
+    ValueError with a plain message when the text holds no usable
+    list."""
+    stripped = text.lstrip("\ufeff").strip()
     if stripped.startswith("{"):
-        items = import_json_text(text)
+        items = import_json_text(stripped)
         if not items:
             raise ValueError("That JSON file holds no links.")
         return items
-    items = import_markdown_text(text)
+    items = import_markdown_text(stripped)
     if not items:
         raise ValueError("No links found in that file.")
     return items
@@ -830,7 +1091,12 @@ def _cache_key(query: str, category: str) -> str:
 
 
 def load_search_cache(query: str, category: str) -> list[dict] | None:
-    """Cached results for an identical search, or None."""
+    """Cached results for an identical search, or None.
+
+    Cached rows are validated like list rows (T12): rows must be
+    dicts, and a date that is not a string becomes unknown rather
+    than crashing the search.
+    """
     path = home_dir() / "cache.json"
     if not path.is_file():
         return None
@@ -853,7 +1119,15 @@ def load_search_cache(query: str, category: str) -> list[dict] | None:
     results = entry.get("results")
     if not isinstance(results, list):
         return None
-    return results
+    cleaned = []
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        if "updated" in row and not isinstance(row["updated"], str):
+            row = dict(row)
+            row["updated"] = ""
+        cleaned.append(row)
+    return cleaned
 
 
 def save_search_cache(query: str, category: str,
@@ -876,7 +1150,8 @@ def save_search_cache(query: str, category: str,
     while len(entries) > SEARCH_CACHE_MAX:
         oldest = min(
             entries,
-            key=lambda k: str(entries[k].get("saved") or ""))
+            key=lambda k: str(entries[k].get("saved") or "")
+            if isinstance(entries[k], dict) else "")
         del entries[oldest]
     _write_json_atomic(path, {"entries": entries})
 

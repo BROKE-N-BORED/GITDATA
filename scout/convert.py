@@ -14,9 +14,10 @@ the report says how many and why. Nothing is invented: a row with
 only a "text" field has no prompt to pair it with, so it is
 skipped, not faked.
 
-Parquet is NOT supported: reading it needs a heavy dependency
-(pyarrow), and this app stays PySide6-only. The UI says so
-plainly instead of pretending.
+Parquet is supported through the optional pyarrow reader
+(scout/parquet.py), imported lazily only when a Parquet file is
+actually converted. Without it, Parquet files are refused in
+plain words instead of failing.
 """
 
 from __future__ import annotations
@@ -28,17 +29,20 @@ import json
 MESSAGE_ROLES = ("system", "user", "assistant")
 
 # Extensions the converter handles, and what they are read as.
+# "parquet" is read from a file path by scout.parquet, not from
+# text: convert_text still raises for it (see below).
 CONVERTIBLE = {
     ".jsonl": "jsonl",
     ".json": "json",
     ".csv": "csv",
     ".tsv": "tsv",
+    ".parquet": "parquet",
 }
 
 # Extensions Scout recognises as data files but cannot convert.
 UNSUPPORTED_NOTE = {
-    ".parquet": "Parquet needs conversion elsewhere: Scout cannot "
-                "read Parquet files.",
+    ".parquet": "Parquet needs the Parquet reader (pyarrow), "
+                "which is not installed.",
     ".arrow": "Arrow needs conversion elsewhere: Scout cannot "
               "read Arrow files.",
     ".txt": "Plain text files have no rows to convert.",
@@ -89,10 +93,6 @@ def map_row(obj: dict) -> tuple[dict | None, str]:
                      "content": _nonempty(msg["content"])}
                     for msg in obj["messages"]]
         return {"messages": messages}, ""
-    if "prompt" in obj or "completion" in obj:
-        return None, "prompt or completion is empty"
-    if "messages" in obj:
-        return None, "messages are not a valid conversation"
     instruction = _nonempty(obj.get("instruction"))
     output = _nonempty(obj.get("output"))
     answer = _nonempty(obj.get("answer"))
@@ -120,6 +120,13 @@ def map_row(obj: dict) -> tuple[dict | None, str]:
     source = _nonempty(obj.get("input"))
     if source and output:
         return {"prompt": source, "completion": output}, ""
+    # A broken prompt/messages field vetoes the row only when no
+    # other mapping worked (v0.1.3 T30): a row with an empty prompt
+    # but a good instruction/output pair still converts.
+    if "prompt" in obj or "completion" in obj:
+        return None, "prompt or completion is empty"
+    if "messages" in obj:
+        return None, "messages are not a valid conversation"
     fields = sorted(str(key) for key in obj.keys())
     if fields and set(fields) <= {"text"}:
         return None, "text only, no prompt to pair it with"
@@ -188,22 +195,52 @@ def convert_json_text(text: str) -> tuple[list[dict], dict]:
                 "skipped": {"not an object": 1}, "format": ""}
 
 
+# Fields map_row understands: a first row holding any of these is
+# a header row; anything else is data (v0.1.3 T33).
+_CSV_KNOWN_FIELDS = frozenset({
+    "prompt", "completion", "messages", "instruction", "input",
+    "output", "answer", "response", "question", "text",
+})
+
+
 def convert_csv_text(text: str, delimiter: str = ",") -> tuple[list[dict], dict]:
-    """Convert .csv/.tsv text to STELLA rows."""
-    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+    """Convert .csv/.tsv text to STELLA rows.
+
+    A first row with no recognised field name is data, not a
+    header: it is kept, under prompt/completion headers (v0.1.3
+    T33). Header names are lowercased, so "Prompt" maps the same
+    as "prompt". Blank rows are skipped.
+    """
+    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    if not rows:
+        return _rows_from_objects([])
+    first = [field.strip().lstrip("\ufeff").lower()
+             for field in rows[0]]
+    if any(field in _CSV_KNOWN_FIELDS for field in first):
+        headers = first
+        data = rows[1:]
+    else:
+        headers = ["prompt", "completion"][:len(rows[0])]
+        data = rows
     objects = []
-    for raw in reader:
+    for raw in data:
+        if not raw or all(not field.strip() for field in raw):
+            continue
         obj = {}
-        for key, value in raw.items():
-            if key is None:
-                continue
-            obj[key.strip().lstrip("\ufeff")] = value
+        for index, header in enumerate(headers):
+            if index < len(raw):
+                obj[header] = raw[index]
         objects.append(obj)
     return _rows_from_objects(objects)
 
 
 def convert_text(text: str, kind: str) -> tuple[list[dict], dict]:
-    """Convert file text by kind: jsonl, json, csv, or tsv."""
+    """Convert file text by kind: jsonl, json, csv, or tsv.
+
+    "parquet" is not a text kind: Parquet is read from a file
+    path by scout.parquet.convert_parquet_file, so it raises
+    here like any other unknown kind.
+    """
     if kind == "jsonl":
         return convert_jsonl_text(text)
     if kind == "json":
