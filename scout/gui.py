@@ -6,15 +6,20 @@ The status bar is the ONLY status surface in the window.
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import html
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED, ThreadPoolExecutor, wait,
+)
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QLockFile, QPoint, QRect, QSettings, QSize, QThread, QTimer, Qt, Signal,
+    QLockFile, QPoint, QRect, QSettings, QSize, QThread, QTimer, Qt, QUrl,
+    Signal,
 )
 from PySide6.QtGui import (
     QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon,
@@ -23,14 +28,15 @@ from PySide6.QtGui import (
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QInputDialog, QLabel, QLayout, QLineEdit, QListWidget, QMainWindow,
-    QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter,
-    QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser, QTextEdit,
-    QVBoxLayout, QWidget,
+    QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLayout, QLineEdit,
+    QListWidget, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+    QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from . import apis, core, download, parquet, score, stella_link, watch
+from . import (apis, core, download, history, parquet, score, selftest,
+               stella_link, watch)
 from . import queue as dlqueue
 
 HERE = Path(__file__).resolve().parent.parent
@@ -46,14 +52,14 @@ DEFAULT_HEIGHT = 700
 RESULT_COLUMNS = ["Title", "Source", "Stars", "Downloads", "Updated",
                   "Description", "License", "Format", "STELLA", "Score"]
 LIST_COLUMNS = ["Title", "Category", "Source", "Stars", "Updated",
-                "Link", "Notes", "State", "STELLA"]
+                "Link", "Notes", "State", "STELLA", "Score"]
 
 # Results table column indexes.
 (R_TITLE, R_SOURCE, R_STARS, R_DOWNLOADS, R_UPDATED, R_DESC,
  R_LICENSE, R_FORMAT, R_STELLA, R_SCORE) = range(len(RESULT_COLUMNS))
 # List table column indexes.
 (L_TITLE, L_CATEGORY, L_SOURCE, L_STARS, L_UPDATED, L_LINK,
- L_NOTES, L_STATE, L_STELLA) = range(len(LIST_COLUMNS))
+ L_NOTES, L_STATE, L_STELLA, L_SCORE) = range(len(LIST_COLUMNS))
 
 # Item data roles: UserRole holds the sort value, UserRole + 1 the
 # index of the row's item in self.results / self.my_list.
@@ -214,6 +220,16 @@ def _cell(text: str, sort_value=None, row_index: int | None = None):
     return item
 
 
+def _score_cell(item: dict):
+    """The quality score cell for one item (T57): the number sorts,
+    the band says what it means, the tooltip shows the working."""
+    scored = score.score_item(item)
+    cell = _cell(f"{scored['score']} {scored['label']}",
+                 sort_value=scored["score"])
+    cell.setToolTip(score.describe_score(scored))
+    return cell
+
+
 def _scaled_font(widget, factor: float):
     """A copy of the widget's font, scaled by factor (053).
 
@@ -259,6 +275,34 @@ def _looks_like_url(text: str) -> bool:
         return False
     host = text.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0]
     return "." in host
+
+
+def _plain_read_error(exc: BaseException) -> str:
+    """A file-read failure in plain words (v0.1.4 T24): no errno,
+    no full paths. A ValueError from the importer already carries
+    plain words ("That JSON file holds no links."), so it is kept;
+    a decoding failure gets a plain line of its own."""
+    if isinstance(exc, FileNotFoundError):
+        return "That file is gone."
+    if isinstance(exc, PermissionError):
+        return "Could not read that file. Check who can open it."
+    if isinstance(exc, UnicodeDecodeError):
+        return "That file is not text Scout can read."
+    if isinstance(exc, ValueError):
+        return str(exc)
+    return "Could not read that file."
+
+
+def _plain_write_error(exc: BaseException) -> str:
+    """A file-write failure in plain words (v0.1.4 T24): no errno,
+    no full paths."""
+    if isinstance(exc, FileNotFoundError):
+        return "That folder is gone. Pick another place to save."
+    if isinstance(exc, PermissionError):
+        return "Could not write there. Pick another place."
+    if isinstance(exc, FileExistsError):
+        return "Something is already in the way there. Pick another place."
+    return "Could not write there."
 
 
 def _inline_error() -> QLabel:
@@ -359,12 +403,20 @@ class CollapsibleSection(QWidget):
 
     Expanded by default: nothing is hidden from a first-time
     user; collapsing is the user's choice when a tab feels busy.
+    With a key, the choice is remembered in the config (T47),
+    like row density: collapsing a section and restarting keeps
+    it collapsed.
     """
 
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, parent=None, key: str | None = None):
         super().__init__(parent)
         self._title = title
+        self._key = key
         self._expanded = True
+        if key is not None:
+            saved = core.load_config().get("sections") or {}
+            if isinstance(saved, dict) and key in saved:
+                self._expanded = bool(saved[key])
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.toggle = QPushButton()
@@ -386,6 +438,14 @@ class CollapsibleSection(QWidget):
     def set_expanded(self, expanded: bool):
         self._expanded = bool(expanded)
         self._refresh()
+        if self._key is not None:
+            config = core.load_config()
+            sections = config.get("sections")
+            if not isinstance(sections, dict):
+                sections = {}
+            sections[self._key] = self._expanded
+            config["sections"] = sections
+            core.save_config(config)
 
     def _flip(self):
         self.set_expanded(not self._expanded)
@@ -518,6 +578,13 @@ class SearchWorker(QThread):
             self.finished_stopped.emit()
             return
         if len(failures) == 2:
+            reasons = [reason for _name, reason in failures]
+            if reasons[0] == reasons[1]:
+                # Both sources failed for the same cause (v0.1.4
+                # T23): say it once, in plain words, instead of
+                # naming each source with the same sentence twice.
+                self.finished_error.emit(reasons[0])
+                return
             detail = "; ".join(
                 f"{name}: {reason}" for name, reason in failures
             )
@@ -546,10 +613,27 @@ class LinkCheckWorker(QThread):
         self.urls = urls
         self.workers = workers
         self._stop_event = threading.Event()
+        self._graceful_stop_event = threading.Event()
 
     def request_stop(self) -> None:
-        """Ask the worker to stop after the links running now."""
+        """Ask the worker to stop at once (v0.1.4 T27).
+
+        Links still being checked are dropped, never waited for:
+        waiting for an in-flight request to time out took ~10 s.
+        Only finished checks are reported, so the stopped count
+        is honest.
+        """
         self._stop_event.set()
+
+    def request_graceful_stop(self) -> None:
+        """Ask the worker to finish the checks in flight and then
+        stop (the close path, v0.1.3 T16): a check already
+        running is allowed to land, so its status survives the
+        close on disk. Unlike request_stop, this never drops a
+        check — the close path waits for the network call to
+        finish or time out instead.
+        """
+        self._graceful_stop_event.set()
 
     def run(self) -> None:  # noqa: N802 - Qt naming
         stopped = False
@@ -566,34 +650,26 @@ class LinkCheckWorker(QThread):
                     status = "unknown"
                 self.item_checked.emit(url, status)
 
-            emitted = set()
-            for future in as_completed(futures):
-                emit(futures[future], future)
-                emitted.add(future)
+            # wait() with a short timeout, not as_completed: the
+            # stop flag is checked every 50 ms, so Stop drops the
+            # in-flight checks at once instead of waiting for the
+            # next one to finish (v0.1.4 T27). Finished checks
+            # are emitted, never thrown away (v0.1.3 T16).
+            pending = set(futures)
+            while pending:
                 if self._stop_event.is_set():
                     stopped = True
-                    # Keep the work that already finished: results
-                    # for links checked before the stop are emitted,
-                    # not thrown away (v0.1.3 T16). Only futures
-                    # the loop has not already emitted: emitting
-                    # one twice would count it twice. A brief grace
-                    # lets checks that finish with the stop land
-                    # too; the next batch is still dropped.
-                    deadline = time.monotonic() + 0.05
-                    for other, url in futures.items():
-                        if other in emitted:
-                            continue
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            break
-                        try:
-                            other.result(timeout=remaining)
-                        except Exception:  # noqa: BLE001 - timeout or a failed check: not finished
-                            pass
-                        if other.done():
-                            emit(url, other)
-                            emitted.add(other)
                     break
+                done, pending = wait(pending, timeout=0.05,
+                                     return_when=FIRST_COMPLETED)
+                for future in done:
+                    emit(futures[future], future)
+            if self._graceful_stop_event.is_set():
+                # The close path asked for a graceful stop: every
+                # check in flight finished and was reported, but
+                # the run still ended early, so it counts as
+                # stopped (v0.1.3 T16).
+                stopped = True
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
         self.all_done.emit(stopped)
@@ -822,6 +898,8 @@ class QueueWorker(QThread):
 # shortcuts and the How to Use text are both built from this, so
 # the help can never drift out of date with the bindings.
 # (key, plain-words description, scope, action name on MainWindow)
+# An action of None means the key is built into the widget (or is
+# a mouse gesture): documented here, bound nowhere (T52).
 SHORTCUTS = [
     ("Ctrl+F", "focuses the search box", "window",
      "_shortcut_focus_search"),
@@ -831,6 +909,10 @@ SHORTCUTS = [
      "remove_selected"),
     ("?", "shows the list of keyboard shortcuts", "window",
      "show_shortcuts_overlay"),
+    ("Enter", "shows the picked result's details", "results", None),
+    ("Ctrl+A", "selects every row in the table", "tables", None),
+    ("Double-click", "opens the picked row in your browser",
+     "tables", None),
 ]
 
 
@@ -856,9 +938,10 @@ HOW_TO_USE_SECTIONS = [
      "Search. Dataset Scout looks on GitHub and Hugging Face and shows "
      "the matches in the table, newest first. Double-click a row to "
      "open it in your browser. Click a column heading to sort by it. "
-     "Recent searches are kept in the search box drop-down. Press "
-     "Load more results at the bottom of the table to see the next "
-     "page."),
+     "Find in these results narrows the rows on screen without a new "
+     "search. Recent searches are kept in the search box drop-down. "
+     "Press Load more results at the bottom of the table to see the "
+     "next page."),
     ("Categories and filters",
      "Pick a category chip to narrow the search: "
      + _category_list_text() + ". "
@@ -875,22 +958,28 @@ HOW_TO_USE_SECTIONS = [
     ("My List and collections",
      "Add results to My List with the buttons under the search table, "
      "or add a link you found yourself with the Add a link I found "
-     "button. Use the List box to keep named lists, like one for "
-     "reasoning and one for math. Remove rows you do not want; Undo "
-     "remove brings them back. Clear all asks first. Drag rows to "
-     "reorder them. Right-click a row for more actions."),
+     "button on the Search tab, the My List tab, or the File menu. "
+     "Use the List box to keep named lists, like one for reasoning "
+     "and one for math. Right-click a row to move it to another list, "
+     "or to open its converted file once it is converted. Remove "
+     "rows you do not want; Undo remove brings them back. Clear all "
+     "asks first. Drag rows to reorder them. The Score column keeps "
+     "the quality score each link had when it was saved."),
     ("States",
      "Each saved link has a state: Found, Downloaded, Converted, or "
      "In STELLA. It follows the real pipeline. Change it with the "
      "Edit button, or right-click a row and pick Mark as. Download "
-     "and convert sets it for you."),
+     "and convert sets it for you. The Edit window also fixes a "
+     "mistyped link, and Undo edit takes back a change made there."),
     ("Check links",
      "Check links visits every link in My List and marks it working, "
      "dead, or unknown. You can stop the check part way through with "
-     "the Stop button. Links already checked stay marked."),
+     "the Stop button. Links already checked stay marked. Remove the "
+     "dead ones clears every dead row at once, after asking."),
     ("STELLA-ready check",
      "Select rows and press Check STELLA-ready to see whether a "
-     "dataset is actually usable: Scout looks at the files it holds "
+     "dataset is actually usable. With nothing selected, it checks "
+     "everything, like Check links does. Scout looks at the files "
      "and says STELLA-ready when a .jsonl file is already in "
      "STELLA's shape, Needs conversion when the data needs work, or "
      "No data files when there is nothing to use. It checks one "
@@ -903,6 +992,10 @@ HOW_TO_USE_SECTIONS = [
      "says how many and why. Parquet files convert too when the "
      "optional pyarrow reader is installed; without it, the report "
      "says the reader is missing."),
+    ("Download history",
+     "Download history in the File menu lists what was converted, "
+     "when, and how many rows, newest first. Pick an entry to open "
+     "the folder its files are in."),
     ("Download queue",
      "Queue several datasets to download and convert instead of "
      "doing them one at a time: select rows in My List and add them "
@@ -950,9 +1043,10 @@ HOW_TO_USE_SECTIONS = [
      "Check for updates in the Help menu looks at the GitHub "
      "releases and says whether a newer version is out."),
     ("Self-test",
-     "scout-cli --self-test checks the app end to end from a "
-     "terminal: search, sniff, and a sample conversion. It prints "
-     "pass or fail in plain words."),
+     "Run self-test in the Help menu checks the app end to end: "
+     "search, sniff, and a sample conversion. It prints pass or fail "
+     "in plain words. scout-cli --self-test runs the same checks "
+     "from a terminal."),
     ("Debug report",
      "Copy debug report in the Sources tab copies the recent log to "
      "the clipboard, with any token removed, so you can share it when "
@@ -1035,7 +1129,9 @@ class ShortcutsDialog(QDialog):
     @staticmethod
     def _build_text() -> str:
         groups = [("window", "Anywhere in the window"),
-                  ("list", "In My List")]
+                  ("results", "In the search results"),
+                  ("list", "In My List"),
+                  ("tables", "In any table")]
         parts = []
         for scope, title in groups:
             rows = [f"{key}  {desc}"
@@ -1094,8 +1190,9 @@ class AddLinkDialog(QDialog):
         """Inline validation (044): on blur, beside the field.
 
         Only after the user has typed: an empty field that merely
-        lost focus gets no error. A bad-looking address warns but
-        still submits; only an empty link blocks the add.
+        lost focus gets no error. A link the check rejects is
+        blocked (v0.1.4 T22): warning about it and adding it
+        anyway planted unopenable links in the list.
         """
         text = self.found_url.text().strip()
         touched = force or self.found_url.isModified()
@@ -1107,33 +1204,53 @@ class AddLinkDialog(QDialog):
                 error = "That does not look like a link. Check it."
         self.url_error.setText(error)
         self.url_error.setVisible(bool(error))
-        return bool(text)
+        return bool(text) and _looks_like_url(text)
 
     def accept(self):  # noqa: N802 - Qt naming
-        # Stay open on an empty link, with the message beside the
-        # field, instead of closing and complaining in the status bar.
+        # Stay open on a missing or bad-looking link, with the
+        # message beside the field, instead of closing and
+        # complaining in the status bar.
         if not self._validate_url(force=True):
             return
         super().accept()
 
 
 class EditItemDialog(QDialog):
-    """Edit a saved link: title, category, notes, state (T12)."""
+    """Edit a saved link: title, category, notes, state (T12).
 
-    def __init__(self, item: dict, parent=None):
+    The link itself is editable too (T58): a mistyped address is
+    fixed in place, keeping the notes, state, and list position.
+    taken_urls are the other rows' links, so an edit cannot
+    duplicate a link that is already in the list.
+    """
+
+    def __init__(self, item: dict, parent=None, taken_urls=()):
         super().__init__(parent)
         self.setWindowTitle("Edit this link")
         self.setMinimumSize(500, 300)
+        self._taken_urls = {core.normalize_url(url)
+                            for url in taken_urls}
         # The category and state as saved (v0.1.3 T31/T43): an
         # untouched save must keep them, even when the category
         # is not one of the built-ins or the state is not one of
         # the known steps.
         self._original_category = item.get("category") or "all"
         self._original_state = item.get("state") or "found"
+        self._original_url = item.get("url") or ""
         layout = QFormLayout(self)
-        layout.addRow("Link:", QLabel(item.get("url") or ""))
+        self.url_field = QLineEdit(self._original_url)
+        self.url_field.setPlaceholderText("https://...")
+        self.url_field.editingFinished.connect(self._validate_url)
+        layout.addRow("Link:", self.url_field)
+        self.url_error = _inline_error()
+        layout.addRow("", self.url_error)
+        layout.addRow("", _explain(
+            "Fix a mistyped address here. The notes, state, and "
+            "place in the list stay put."))
         self.title_field = QLineEdit(item.get("title") or "")
         layout.addRow("Title:", self.title_field)
+        self.title_error = _inline_error()
+        layout.addRow("", self.title_error)
         layout.addRow("", _explain("The name shown in My List."))
         self.category_field = QComboBox()
         self.category_field.setEditable(True)
@@ -1175,6 +1292,55 @@ class EditItemDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addRow("", buttons)
 
+    def _validate_url(self, force: bool = False) -> bool:
+        """Inline validation, the same check as the add form (044).
+
+        Only after the user has typed: an untouched field gets no
+        error. A link the check rejects blocks the save, as on
+        the add form (v0.1.4 T22); an empty link and a link
+        already in the list block it too.
+        """
+        text = self.url_field.text().strip()
+        touched = force or self.url_field.isModified()
+        error = ""
+        blocked = False
+        if touched:
+            if not text:
+                error = "Paste a link first."
+                blocked = True
+            elif (core.normalize_url(text) in self._taken_urls
+                    and text != self._original_url):
+                error = "That link is already in My List."
+                blocked = True
+            elif not _looks_like_url(text):
+                error = "That does not look like a link. Check it."
+                blocked = True
+        self.url_error.setText(error)
+        self.url_error.setVisible(bool(error))
+        return not blocked
+
+    def _validate_title(self) -> bool:
+        """A blank title blocks the save (v0.1.4 T26): saving one
+        used to say "Saved the changes." while silently keeping
+        the old title."""
+        if self.title_field.text().strip():
+            self.title_error.setText("")
+            self.title_error.setVisible(False)
+            return True
+        self.title_error.setText("Give the link a title.")
+        self.title_error.setVisible(True)
+        return False
+
+    def accept(self):  # noqa: N802 - Qt naming
+        # Stay open on an empty link, a duplicate, or a blank
+        # title, with the message beside the field, instead of
+        # closing and complaining in the status bar.
+        if not self._validate_url(force=True):
+            return
+        if not self._validate_title():
+            return
+        super().accept()
+
     def values(self) -> dict:
         """The edited values, with the category as a key.
 
@@ -1189,6 +1355,7 @@ class EditItemDialog(QDialog):
             category = core.category_key_for_label(text)
         return {
             "title": self.title_field.text().strip(),
+            "url": self.url_field.text().strip(),
             "category": category,
             "notes": self.notes_field.text().strip(),
             "state": self.state_field.currentData(),
@@ -1299,11 +1466,15 @@ class DownloadDialog(QDialog):
     def _on_item_done(self, index: int, ok: bool, message: str,
                       outputs: list, rows: int, state: str):
         title = ""
+        url = ""
+        source = ""
         # The item dicts are the same objects the main window holds,
         # so updating the state here updates My List too.
         for _idx, item in self.items:
             if _idx == index:
                 title = item.get("title") or ""
+                url = item.get("url") or ""
+                source = item.get("source") or ""
                 item["state"] = state
                 break
         self._outputs_by_index[index] = list(outputs)
@@ -1313,17 +1484,38 @@ class DownloadDialog(QDialog):
         if ok:
             self._done_ok += 1
             self._done_rows += rows
+            # The download history (T61): what was converted, when,
+            # and how many rows. A history write must never break
+            # the download flow, so a failure is logged, not raised.
+            try:
+                history.record_conversion(title, url, source, rows,
+                                          outputs)
+            except OSError as exc:
+                core.log_error(f"Could not record the download: {exc}")
 
     def _on_all_done(self, stopped: bool):
         self.stop_button.setEnabled(False)
         self.close_button.setEnabled(True)
-        self.open_button.setEnabled(True)
+        # "Open the folder" only when there is something in it
+        # (v0.1.4 T30): after a failed run it opened an empty
+        # folder.
+        self.open_button.setEnabled(
+            any(self._outputs_by_index.values()))
         self.stella_button.setEnabled(
             any(self._outputs_by_index.values()))
+        # The bar shows the share that converted (v0.1.4 T16): a
+        # run that converted nothing ends at 0, not full.
         self.bar.setMaximum(100)
-        self.bar.setValue(100)
+        total = len(self.items)
+        self.bar.setValue(
+            int(100 * self._done_ok / total) if total else 0)
         if stopped:
             self._log("Stopped part way through.")
+        elif self._done_ok == 0:
+            # No checkmark and no full bar on a zero-success run:
+            # a refused or stopped run is not a success to
+            # celebrate (v0.1.4 T16).
+            self._log("Nothing converted.")
         else:
             # The completion moment (008): a checkmark plus a
             # one-line summary of what the run produced.
@@ -1372,7 +1564,7 @@ class WatchDialog(QDialog):
         self.watch_list = QListWidget()
         self.watch_list.setToolTip(
             "The searches Scout watches. Pick one to see what is new.")
-        self.watch_list.currentRowChanged.connect(self._watch_selected)
+        self.watch_list.currentRowChanged.connect(self._watch_picked)
         layout.addWidget(self.watch_list, stretch=1)
         self.new_label = QLabel("Pick a watch to see what is new.")
         layout.addWidget(self.new_label)
@@ -1408,20 +1600,44 @@ class WatchDialog(QDialog):
         self.refresh()
 
     def refresh(self):
-        """Reload the watches from disk and refill the lists."""
+        """Reload the watches from disk and refill the lists.
+
+        The picked watch stays picked (T43): the selection is
+        restored by watch id, so Pause turns into Resume on the
+        same row instead of looking broken.
+        """
+        picked_id = None
+        picked = self._selected_watch()
+        if picked is not None:
+            picked_id = picked.get("id")
         self.watches = watch.load_watches()
+        self.watch_list.blockSignals(True)
         self.watch_list.clear()
         for item in self.watches:
-            count = len(item.get("new") or [])
-            text = (f"{item['query']} "
-                    f"({core.category_label(item.get('category') or 'all')})")
-            if count:
-                word = "dataset" if count == 1 else "datasets"
-                text += f"  {count} new {word}"
-            if not item.get("enabled", True):
-                text += " (paused)"
-            self.watch_list.addItem(text)
+            self.watch_list.addItem(self._watch_row_text(item))
+        restore = -1
+        if picked_id is not None:
+            for row, item in enumerate(self.watches):
+                if item.get("id") == picked_id:
+                    restore = row
+                    break
+        self.watch_list.setCurrentRow(restore)
+        self.watch_list.blockSignals(False)
         self._watch_selected()
+
+    @staticmethod
+    def _watch_row_text(item: dict) -> str:
+        """One row: the search, its new count while unseen (T42),
+        and (paused) when it is paused."""
+        text = (f"{item['query']} "
+                f"({core.category_label(item.get('category') or 'all')})")
+        count = len(item.get("new") or [])
+        if count and not item.get("new_seen", True):
+            word = "dataset" if count == 1 else "datasets"
+            text += f"  {count} new {word}"
+        if not item.get("enabled", True):
+            text += " (paused)"
+        return text
 
     def _selected_watch(self) -> dict | None:
         row = self.watch_list.currentRow()
@@ -1429,12 +1645,46 @@ class WatchDialog(QDialog):
             return self.watches[row]
         return None
 
+    def _refresh_buttons(self):
+        """Enable only the buttons that have something to act on
+        (T44): a dead button that silently does nothing looks
+        broken."""
+        picked = self._selected_watch()
+        self.check_now_button.setEnabled(bool(self.watches))
+        self.add_new_button.setEnabled(
+            picked is not None and bool(picked.get("new")))
+        self.pause_button.setEnabled(picked is not None)
+        self.remove_button.setEnabled(picked is not None)
+
+    def _watch_picked(self, _row: int = -1):
+        """The user picked a watch: its new items are seen now
+        (T42), so the flag clears while the items stay listed."""
+        picked = self._selected_watch()
+        if (picked is not None and picked.get("new")
+                and not picked.get("new_seen", True)):
+            picked["new_seen"] = True
+            watch.save_watches(self.watches)
+            row = self.watch_list.currentRow()
+            item = self.watch_list.item(row)
+            if item is not None:
+                item.setText(self._watch_row_text(picked))
+        self._watch_selected()
+
     def _watch_selected(self):
         picked = self._selected_watch()
         self.new_list.clear()
         if picked is None:
-            self.new_label.setText("Pick a watch to see what is new.")
+            if not self.watches:
+                # Empty state teaches (T48, 031): how a watch
+                # comes to exist, in the line the eye lands on.
+                self.new_label.setText(
+                    "No watched searches yet. Run a search, then "
+                    "press Watch this search to watch it.")
+            else:
+                self.new_label.setText(
+                    "Pick a watch to see what is new.")
             self.pause_button.setText("Pause this watch")
+            self._refresh_buttons()
             return
         self.pause_button.setText(
             "Resume this watch" if not picked.get("enabled", True)
@@ -1453,11 +1703,20 @@ class WatchDialog(QDialog):
         else:
             self.new_label.setText(
                 f"Nothing new since the last run ({when}).")
+        self._refresh_buttons()
 
     def _check_now(self):
         parent = self.parent()
-        if parent is not None and hasattr(parent, "_run_due_watches"):
-            parent._run_due_watches(force=True)
+        if parent is None or not hasattr(parent, "_run_due_watches"):
+            return
+        if getattr(parent, "_online", None) is False:
+            # Offline Check now must say so (T46), not run
+            # silently into nothing.
+            parent.statusBar().showMessage(
+                "You are offline. Watched searches wait until you "
+                "are back online.")
+            return
+        parent._run_due_watches(force=True)
 
     def _add_new_to_list(self):
         picked = self._selected_watch()
@@ -1473,6 +1732,7 @@ class WatchDialog(QDialog):
             parent._save_list()
             parent._refresh_list_tab()
         picked["new"] = []
+        picked["new_seen"] = True
         watch.save_watches(self.watches)
         self.refresh()
         parent.statusBar().showMessage(f"Added {added} to My List.")
@@ -1496,6 +1756,12 @@ class WatchDialog(QDialog):
             | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
+            # Say what was kept (T35): a stale message describing
+            # something the user did not do is a lie by omission.
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "statusBar"):
+                parent.statusBar().showMessage(
+                    f"Kept watching {picked['query']!r}.")
             return
         watch.save_watches(
             watch.remove_watch(self.watches, picked["id"]))
@@ -1516,8 +1782,9 @@ class QueueDialog(QDialog):
         layout = QVBoxLayout(self)
         intro = QLabel(
             "Queued datasets download and convert one at a time. "
-            "Pause stops after the one running now; Start picks up "
-            "where it left off, even after closing the app.")
+            "Pause stops the download now and queues that dataset "
+            "again; Start picks up where it left off, even after "
+            "closing the app.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         self.queue_table = QTableWidget(0, 3)
@@ -1529,7 +1796,17 @@ class QueueDialog(QDialog):
             QAbstractItemView.EditTrigger.NoEditTriggers)
         self.queue_table.setAlternatingRowColors(True)
         self.queue_table.horizontalHeader().setStretchLastSection(True)
+        self.queue_table.itemSelectionChanged.connect(
+            self._refresh_buttons)
         layout.addWidget(self.queue_table, stretch=1)
+        # The empty state teaches how the queue fills (T48):
+        # refresh() shows this when there is nothing queued.
+        self.empty_label = QLabel(
+            "Nothing in the queue yet. Select rows in My List and "
+            "press Add selected to queue.")
+        self.empty_label.setStyleSheet("color: #9fb0cc;")
+        self.empty_label.setWordWrap(True)
+        layout.addWidget(self.empty_label)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumHeight(120)
@@ -1550,6 +1827,11 @@ class QueueDialog(QDialog):
         self.pause_button.setEnabled(False)
         self.pause_button.clicked.connect(self.pause_queue)
         row.addWidget(self.pause_button)
+        self.retry_button = QPushButton("Retry failed")
+        self.retry_button.setToolTip(
+            "Queue the failed downloads again, so Start can try them.")
+        self.retry_button.clicked.connect(self._retry_failed)
+        row.addWidget(self.retry_button)
         self.remove_button = QPushButton("Remove selected")
         self.remove_button.setToolTip("Take the picked rows out of the queue.")
         self.remove_button.clicked.connect(self._remove_selected)
@@ -1568,9 +1850,22 @@ class QueueDialog(QDialog):
         self.refresh()
 
     def refresh(self):
-        """Reload the queue from disk and refill the table."""
-        entries, interrupted = dlqueue.load_queue()
-        self.entries = entries
+        """Reload the queue from disk and refill the table.
+
+        While a run is in progress the in-memory entries are the
+        truth (v0.1.4 T14): reloading from disk would reset the
+        running entry to queued and log a false "stopped part way
+        through" line on a normal run, and "Downloading" would
+        never show. Only the table is redrawn mid-run; the
+        interrupted count is for a fresh load after a crash or a
+        close mid-run.
+        """
+        if self.worker is not None and self.worker.isRunning():
+            entries = self.entries
+            interrupted = 0
+        else:
+            entries, interrupted = dlqueue.load_queue()
+            self.entries = entries
         if interrupted:
             word = "download" if interrupted == 1 else "downloads"
             self._log(f"{interrupted} {word} stopped part way "
@@ -1586,6 +1881,40 @@ class QueueDialog(QDialog):
             rows = entry.get("rows") or 0
             table.setItem(row, 2, _cell(str(rows) if rows else ""))
         table.resizeColumnsToContents()
+        self.empty_label.setVisible(len(entries) == 0)
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        """Enable only the buttons that have something to act on
+        (T44). Pause is left alone: the run owns it."""
+        running = self.worker is not None and self.worker.isRunning()
+        states = [entry["state"] for entry in self.entries]
+        self.start_button.setEnabled(
+            not running and dlqueue.QUEUED in states)
+        self.retry_button.setEnabled(dlqueue.FAILED in states)
+        self.clear_button.setEnabled(
+            dlqueue.DONE in states or dlqueue.FAILED in states)
+        self.remove_button.setEnabled(
+            bool(self.queue_table.selectedIndexes()))
+
+    def _retry_failed(self):
+        """Queue failed entries again (T45): the picked failed
+        rows, or every failed row when none are picked."""
+        rows = {index.row() for index in
+                self.queue_table.selectedIndexes()}
+        picked_failed = [self.entries[row]["id"] for row in sorted(rows)
+                         if 0 <= row < len(self.entries)
+                         and self.entries[row]["state"] == dlqueue.FAILED]
+        ids = picked_failed or None
+        count = dlqueue.retry_failed(self.entries, ids)
+        if not count:
+            self._log("No failed downloads to retry.")
+            return
+        dlqueue.save_queue(self.entries)
+        self.refresh()
+        word = "download" if count == 1 else "downloads"
+        self._log(f"{count} failed {word} queued again. "
+                  "Press Start to try them.")
 
     def _log(self, text: str):
         self.log_view.append(text)
@@ -1663,22 +1992,62 @@ class QueueDialog(QDialog):
                 entry["error"] = "" if ok else message
                 # The list item's own state follows the pipeline too.
                 entry["item"]["state"] = state
+                if ok:
+                    # The download history (T61): a queued
+                    # conversion is recorded like a single one.
+                    try:
+                        history.record_conversion(
+                            entry["item"].get("title") or "",
+                            entry["item"].get("url") or "",
+                            entry["item"].get("source") or "",
+                            rows, outputs)
+                    except OSError as exc:
+                        core.log_error(
+                            f"Could not record the download: {exc}")
             dlqueue.save_queue(self.entries)
         title = entry["item"].get("title") if entry else ""
-        self._log(f"{title}: {message}")
+        if state == "stopped":
+            # A clean pause is a pause (v0.1.4 T14), not a failed
+            # download: the report's "Nothing could be
+            # downloaded." belongs to a real failure, not to the
+            # user pressing Pause.
+            self._log(f"{title}: Paused. Start resumes the download.")
+        else:
+            self._log(f"{title}: {message}")
         self.bar.setMaximum(100)
         self.bar.setValue(100 if ok else 0)
         self.refresh()
         parent = self.parent()
+        if parent is not None and entry is not None \
+                and state != "stopped":
+            # The My List row follows the queue run (v0.1.4 T15):
+            # the queue holds its own copy of the item, so the
+            # list row is updated by URL, exactly as a single
+            # download updates it.
+            find = getattr(parent, "_find_list_index", None)
+            if callable(find) and hasattr(parent, "my_list"):
+                list_index = find(entry["item"].get("url") or "")
+                if list_index >= 0:
+                    parent.my_list[list_index]["state"] = state
+                    save = getattr(parent, "_save_list", None)
+                    if callable(save):
+                        save()
         if parent is not None and hasattr(parent, "_refresh_list_tab"):
             parent._refresh_list_tab()
 
     def _on_all_done(self, stopped: bool):
-        self.start_button.setEnabled(True)
         self.pause_button.setEnabled(False)
         self.bar.setMaximum(100)
-        self.bar.setValue(100)
+        # The bar shows the share that finished (v0.1.4 T16): a
+        # run that finished nothing ends at 0, not full.
         total = dlqueue.counts(self.entries)
+        all_entries = total["total"]
+        self.bar.setValue(
+            int(100 * total["done"] / all_entries) if all_entries else 0)
+        # Start only comes back when something is waiting (T44):
+        # after a full run it would otherwise sit enabled while
+        # doing nothing but logging "Nothing is waiting."
+        self._refresh_buttons()
         if stopped:
             self._log("Paused. Start resumes the queue.")
         else:
@@ -1799,6 +2168,199 @@ class StellaLinkDialog(QDialog):
         else:
             self._show_error(result["message"])
         return result
+
+
+class HistoryDialog(QDialog):
+    """Download history (T61): what was converted, when, how many
+    rows. Newest first. Opening the folder takes the user back to
+    the converted files."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Download history")
+        self.setMinimumSize(640, 360)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Every download and convert that produced files, newest "
+            "first."))
+        self.history_table = QTableWidget(0, 4)
+        self.history_table.setHorizontalHeaderLabels(
+            ["Dataset", "Converted", "Rows", "Files"])
+        self.history_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.history_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_table.setAlternatingRowColors(True)
+        self.history_table.horizontalHeader().setStretchLastSection(True)
+        self.history_table.doubleClicked.connect(self.open_folder)
+        layout.addWidget(self.history_table, stretch=1)
+        self.empty_label = QLabel(
+            "Nothing converted yet. Download and convert a dataset "
+            "and it shows up here.")
+        self.empty_label.setStyleSheet("color: #9fb0cc;")
+        layout.addWidget(self.empty_label)
+        row = QHBoxLayout()
+        self.open_button = QPushButton("Open the folder")
+        self.open_button.setToolTip(
+            "Open the folder with this conversion's files.")
+        self.open_button.clicked.connect(self.open_folder)
+        row.addWidget(self.open_button)
+        self.clear_button = QPushButton("Clear history")
+        self.clear_button.setToolTip(
+            "Forget every entry in this history. The converted "
+            "files stay on disk.")
+        self.clear_button.clicked.connect(self.clear_history)
+        row.addWidget(self.clear_button)
+        close_button = QPushButton("Close")
+        close_button.setToolTip("Close this window.")
+        close_button.clicked.connect(self.accept)
+        row.addWidget(close_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        """Refill the table from the saved history."""
+        self.entries = history.load_history()
+        table = self.history_table
+        table.setSortingEnabled(False)
+        table.setRowCount(len(self.entries))
+        for row, entry in enumerate(self.entries):
+            table.setItem(row, 0, _cell(entry.get("title") or ""))
+            table.setItem(row, 1,
+                          _cell(core.format_date(entry.get("when"))))
+            table.setItem(row, 2,
+                          _cell(str(entry.get("rows") or 0),
+                                sort_value=core._safe_int(
+                                    entry.get("rows"))))
+            files = entry.get("files") or []
+            if len(files) == 1:
+                files_text = files[0]
+            elif files:
+                files_text = f"{len(files)} files"
+            else:
+                files_text = ""
+            files_cell = _cell(files_text)
+            if len(files) > 1:
+                files_cell.setToolTip(", ".join(files))
+            table.setItem(row, 3, files_cell)
+        table.setSortingEnabled(True)
+        table.resizeColumnsToContents()
+        self.empty_label.setVisible(not self.entries)
+        self.open_button.setEnabled(bool(self.entries))
+        self.clear_button.setEnabled(bool(self.entries))
+
+    def _selected_entry(self) -> dict | None:
+        rows = {index.row()
+                for index in self.history_table.selectedIndexes()}
+        if not rows:
+            return None
+        row = sorted(rows)[0]
+        if 0 <= row < len(self.entries):
+            return self.entries[row]
+        return None
+
+    def open_folder(self):
+        """Open the picked conversion's folder, if it is still there."""
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        folder = entry.get("folder") or ""
+        if folder and Path(folder).is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        else:
+            QMessageBox.information(
+                self, "Folder not found",
+                "That folder is gone. The files may have been moved "
+                "or deleted.")
+
+    def clear_history(self):
+        """Forget every entry, after asking (U23, U31)."""
+        if not self.entries:
+            return
+        answer = QMessageBox.question(
+            self, "Clear download history",
+            "Forget every entry in the download history? The "
+            "converted files stay on disk.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        history.clear_history()
+        self.refresh()
+
+
+class SelfTestWorker(QThread):
+    """Runs the self-test off the UI thread (T64, U30).
+
+    The search and sniff checks use the network and take seconds;
+    the window stays responsive while they run.
+    """
+
+    done = Signal(list)
+
+    def run(self) -> None:  # noqa: N802 - Qt naming
+        try:
+            checks = selftest.run_checks()
+        except Exception as exc:  # noqa: BLE001 - a crashed self-test is a failed report, not a crash
+            checks = [{"name": "Self-test", "ok": False,
+                       "detail": f"could not run: {exc}"}]
+        self.done.emit(checks)
+
+
+class SelfTestDialog(QDialog):
+    """The self-test in the app (T64): the same three checks as
+    `scout-cli --self-test`, with the plain-words result."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Self-test")
+        self.setMinimumSize(560, 320)
+        self.worker: SelfTestWorker | None = None
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "The self-test checks search, sniff, and conversion end "
+            "to end. It takes a few seconds and changes nothing."))
+        self.report_view = QTextEdit()
+        self.report_view.setReadOnly(True)
+        layout.addWidget(self.report_view, stretch=1)
+        row = QHBoxLayout()
+        self.run_button = QPushButton("Run the self-test")
+        self.run_button.setToolTip(
+            "Run the self-test again.")
+        self.run_button.clicked.connect(self.start_test)
+        row.addWidget(self.run_button)
+        close_button = QPushButton("Close")
+        close_button.setToolTip("Close this window.")
+        close_button.clicked.connect(self.accept)
+        row.addWidget(close_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+    def start_test(self):
+        """Run the checks in the background and show the report."""
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.run_button.setEnabled(False)
+        self.report_view.setPlainText("Running the self-test...")
+        self.worker = SelfTestWorker(parent=self)
+        self.worker.done.connect(self._show_report)
+        self.worker.start()
+
+    def _show_report(self, checks: list):
+        self.run_button.setEnabled(True)
+        self.report_view.setPlainText(selftest.format_report(checks))
+        passed = sum(1 for check in checks if check.get("ok"))
+        core.log(f"Self-test (GUI): {passed} of {len(checks)} "
+                 "checks passed.")
+
+    def closeEvent(self, event):  # noqa: N802 - Qt naming
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.wait(30000)
+        super().closeEvent(event)
 
 
 # ------------------------------------------------------------ single instance
@@ -1933,6 +2495,8 @@ class MainWindow(QMainWindow):
         self._online: bool | None = None
         self._watch_dialog: WatchDialog | None = None
         self._queue_dialog: QueueDialog | None = None
+        self._history_dialog: HistoryDialog | None = None
+        self._selftest_dialog: SelfTestDialog | None = None
         # Watch timer (T63): re-runs due watches while the app is
         # open. Started by start_background_checks, never here, so
         # constructing the window never touches the network.
@@ -1951,6 +2515,10 @@ class MainWindow(QMainWindow):
         # (site dict, position) or None.
         self._removed_site = None
         self._undo_stack: list[list[tuple[int, dict]]] = []
+        # Edits waiting to be undone (T59): (the item as it was
+        # before the edit, after-edit normalised URL). The
+        # after-edit URL finds the row again if the list moved.
+        self._edit_undo_stack: list[tuple[dict, str]] = []
         self._last_query: str | None = None
         self._last_category: str | None = None
         self._results_sorting = True
@@ -1959,6 +2527,16 @@ class MainWindow(QMainWindow):
         self._showing_skeleton = False
         self._stella_target = "results"
         self._searched_once = False
+        # A line the empty results label shows instead of its
+        # usual text (v0.1.4 T18/T29): a failed or offline search
+        # says so, instead of showing the never-searched hint.
+        self._results_empty_note = ""
+        # The checklist's completion beat (T36) starts as shown:
+        # a returning user whose setup is already done must not
+        # see the list flash on every launch. It clears the first
+        # time a refresh finds the list incomplete, so a new user
+        # still gets the beat when they finish.
+        self._checklist_done_shown = True
         # Keys the menu bar already binds (T45): _build_shortcuts
         # skips them, so one key never fires two handlers.
         self._menu_shortcut_keys: set[str] = set()
@@ -2008,7 +2586,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.finish_label)
         # The GitHub rate meter (T16) and the live stats strip
         # (T25). Neither is a status text surface: they show numbers.
-        self.rate_label = QLabel("GitHub: searches left unknown")
+        self.rate_label = QLabel("GitHub: quota unknown")
         self.rate_label.setObjectName("rate_meter")
         self.statusBar().addPermanentWidget(self.rate_label)
         self.stats_label = QLabel("")
@@ -2022,6 +2600,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.health_takeaway)
         self._refresh_stats()
         self._refresh_checklist()
+        self._layout_status_bar()
 
         self.statusBar().showMessage(
             "Type a few words and press Search, or pick a category below."
@@ -2031,6 +2610,31 @@ class MainWindow(QMainWindow):
         notice = core.list_load_notice()
         if notice:
             self.statusBar().showMessage(notice)
+
+    def _layout_status_bar(self):
+        """Give the status text priority over the permanent
+        widgets (T33).
+
+        At the default width the rate meter, stats, health bar,
+        and takeaway together clip the message mid-word (and the
+        reset time with it). The takeaway and the bar hide first
+        as the window narrows: their numbers already live in the
+        stats strip, so nothing is lost, and the message gets
+        the room.
+        """
+        if not hasattr(self, "health_takeaway"):
+            return
+        width = self.width()
+        self.health_takeaway.setVisible(width >= 1300)
+        self.health_bar.setVisible(width >= 1200)
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._layout_status_bar()
+        # A narrower window re-fits the results columns (T31):
+        # the fit from the last search assumed the old width.
+        if hasattr(self, "results_table") and self.results:
+            self._fit_results_columns()
 
     # ------------------------------------------------------------ menus (T23, U38)
 
@@ -2069,6 +2673,9 @@ class MainWindow(QMainWindow):
             file_menu, "Import a list", self.import_list,
             "Read a list you exported back into My List.")
         self._menu_action(
+            file_menu, "Add a link I found", self.show_add_link_dialog,
+            "Add a link you found yourself to My List.")
+        self._menu_action(
             file_menu, "Send to STELLA", self.send_to_stella,
             "Write the STELLA manifest into the STELLA folder on this PC.")
         self._menu_action(
@@ -2079,6 +2686,9 @@ class MainWindow(QMainWindow):
         self._menu_action(
             file_menu, "Watched searches", self.show_watches,
             "See the searches Scout re-runs for you, and what is new.")
+        self._menu_action(
+            file_menu, "Download history", self.show_history,
+            "See what was converted, when, and how many rows.")
         file_menu.addSeparator()
         self._menu_action(
             file_menu, "Exit", self.close, "Close Dataset Scout.")
@@ -2087,6 +2697,9 @@ class MainWindow(QMainWindow):
         self._menu_action(
             edit_menu, "Undo remove", self.undo_remove,
             "Bring back the rows removed most recently.")
+        self._menu_action(
+            edit_menu, "Undo edit", self.undo_edit,
+            "Undo the last change made in the Edit window.")
         self._menu_action(
             edit_menu, "Remove selected", self.remove_selected,
             "Remove the picked rows from My List. Delete does this too.",
@@ -2138,6 +2751,10 @@ class MainWindow(QMainWindow):
             help_menu, "Check for updates", self.check_for_updates,
             "Look on GitHub for a newer version of Dataset Scout.")
         self._menu_action(
+            help_menu, "Run self-test", self.show_selftest,
+            "Check search, sniff, and conversion end to end, and "
+            "show the result in plain words.")
+        self._menu_action(
             help_menu, "About Dataset Scout", self._show_about,
             "Show the version of Dataset Scout.")
 
@@ -2150,6 +2767,10 @@ class MainWindow(QMainWindow):
         them, so ? and Delete keep working while the user types.
         """
         for key, _desc, scope, action in SHORTCUTS:
+            if action is None:
+                # Documented only (T52): the widget already owns
+                # the key, or it is a mouse gesture, not a key.
+                continue
             if key in self._menu_shortcut_keys:
                 continue
             parent = self.list_table if scope == "list" else self
@@ -2165,14 +2786,30 @@ class MainWindow(QMainWindow):
     def _shortcut_export_stella(self):
         self.export_list("stella")
 
-    def _show_about(self):
-        QMessageBox.about(
-            self, "About Dataset Scout",
+    def _about_text(self) -> str:
+        """The About box text, including the persistent record of
+        a list recovery when one happened (T53): the smallest
+        honest place for it, since the status bar is the only
+        status surface and its notice is transient."""
+        text = (
             f"Dataset Scout {core.VERSION}\n\n"
             "Find training datasets for STELLA, build lists of links.\n"
             "Searches GitHub and Hugging Face live, checks whether "
             "datasets are STELLA-ready, and converts downloads to "
             "STELLA .jsonl files.")
+        record = core.load_config().get("list_recovered")
+        if isinstance(record, dict) and record.get("links") is not None:
+            count = core._safe_int(record.get("links"))
+            word = "link" if count == 1 else "links"
+            when = core.format_date(record.get("date") or "")
+            text += (
+                f"\n\nYour saved list was damaged once and loaded "
+                f"from the backup copy instead ({count} {word} "
+                f"recovered{', ' + when if when else ''}).")
+        return text
+
+    def _show_about(self):
+        QMessageBox.about(self, "About Dataset Scout", self._about_text())
 
     # ------------------------------------------------------------ update check (T21)
 
@@ -2216,12 +2853,14 @@ class MainWindow(QMainWindow):
         remaining = apis.GITHUB_RATE.get("search_remaining")
         reset = apis.GITHUB_RATE.get("search_reset")
         if remaining is None:
-            self.rate_label.setText("GitHub: searches left unknown")
+            # Short on purpose (T33): the meter shares the bar
+            # with the message, and a long meter clips both.
+            self.rate_label.setText("GitHub: quota unknown")
             return
         if remaining == 1:
-            text = "GitHub: 1 search left"
+            text = "GitHub: 1 left"
         else:
-            text = f"GitHub: {remaining} searches left"
+            text = f"GitHub: {remaining} left"
         if reset is not None:
             text += f", resets {reset.astimezone().strftime('%H:%M')}"
         self.rate_label.setText(text)
@@ -2310,7 +2949,14 @@ class MainWindow(QMainWindow):
                        self.watch_worker, self._online_worker):
             if worker is None:
                 continue
-            if hasattr(worker, "request_stop"):
+            if hasattr(worker, "request_graceful_stop"):
+                # The close path lets in-flight work land
+                # (v0.1.3 T16): a link check already running
+                # finishes and its status survives on disk. The
+                # Stop button's at-once drop (v0.1.4 T27) is for
+                # the user pressing Stop, not for closing.
+                worker.request_graceful_stop()
+            elif hasattr(worker, "request_stop"):
                 worker.request_stop()
             if worker.isRunning():
                 worker.wait(25000)
@@ -2440,6 +3086,11 @@ class MainWindow(QMainWindow):
             widget.setEnabled(not locked)
         self.undo_button.setEnabled(
             (not locked) and bool(self._undo_stack))
+        if hasattr(self, "undo_edit_button"):
+            self.undo_edit_button.setEnabled(
+                (not locked) and bool(self._edit_undo_stack))
+        if hasattr(self, "remove_dead_button"):
+            self._refresh_dead_button()
         searching = (self.search_worker is not None
                      and self.search_worker.isRunning())
         self.search_button.setEnabled(not locked and not searching)
@@ -2595,8 +3246,25 @@ class MainWindow(QMainWindow):
                     for col in data.get("collections", []))
         has_token = bool(core.get_github_token())
         if searched and saved:
+            if not getattr(self, "_checklist_done_shown", False):
+                # The completion moment (T36): show the final
+                # ticked list for a beat before hiding it, so
+                # finishing setup feels finished. The flag resets
+                # whenever the list is incomplete again.
+                self._checklist_done_shown = True
+                self.checklist_box.setVisible(True)
+                for key, label in self.checklist_labels.items():
+                    text = self.checklist_texts[key]
+                    done = key in ("installed", "search", "save") \
+                        or (key == "token" and has_token)
+                    mark = "✓ " if done else "○ "
+                    label.setText(mark + text)
+                QTimer.singleShot(
+                    1500, self._hide_checklist_after_completion)
+                return
             self.checklist_box.setVisible(False)
             return
+        self._checklist_done_shown = False
         self.checklist_box.setVisible(True)
         states = {"installed": True, "search": searched,
                   "save": saved, "token": has_token}
@@ -2604,6 +3272,11 @@ class MainWindow(QMainWindow):
             text = self.checklist_texts[key]
             mark = "✓ " if states[key] else "○ "
             label.setText(mark + text)
+
+    def _hide_checklist_after_completion(self):
+        """Hide the ticked checklist once its beat is over (T36)."""
+        if hasattr(self, "checklist_box"):
+            self.checklist_box.setVisible(False)
 
     def _dismiss_checklist(self):
         """Hide the first-run checklist for good."""
@@ -2623,6 +3296,10 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         inner = QWidget()
         layout = QVBoxLayout(inner)
+        # Tight on purpose (T31): at 1100x700 the results, the
+        # Add buttons, and Load more must show without scrolling.
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(2)
 
         heading = _heading("Dataset finder for STELLA")
         layout.addWidget(heading)
@@ -2644,9 +3321,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.offline_banner)
 
         # The first-run checklist (T56, 020): three steps to a first
-        # result, the first honestly ticked, gone when done.
+        # result, the first honestly ticked, gone when done. A
+        # wrapping flow (T31): one row at 1100 px, two at 900, so
+        # the steps stop squeezing the results off a 1100x700
+        # window on a new user's first search.
         self.checklist_box = QGroupBox("First steps")
-        checklist_layout = QVBoxLayout(self.checklist_box)
+        # Less chrome (T31): the group-box margin and padding cost
+        # ~20 px the results need at 1100x700.
+        self.checklist_box.setStyleSheet(
+            "QGroupBox { margin-top: 4px; padding-top: 4px; }")
+        checklist_layout = FlowLayout(self.checklist_box)
         self.checklist_texts = {
             "installed": "Dataset Scout is installed and running",
             "search": "Run your first search",
@@ -2730,6 +3414,18 @@ class MainWindow(QMainWindow):
         self.window_combo.setCurrentText("12 months")
         self.window_combo.setToolTip(
             "Only show results updated in the last few months.")
+        # The window choice is remembered between runs (T65), like
+        # the row density: the default stays Active-only, 12 months,
+        # exactly as before, and only a choice the user made wins.
+        _saved_filters = core.load_config()
+        _saved_window = _saved_filters.get("active_window")
+        if _saved_window in core.ACTIVE_WINDOWS:
+            self.window_combo.setCurrentText(_saved_window)
+        self.active_check.setChecked(
+            bool(_saved_filters.get("active_only", True)))
+        self.active_check.toggled.connect(self._save_search_filters)
+        self.window_combo.currentTextChanged.connect(
+            self._save_search_filters)
         filter_row.addWidget(QLabel("Updated in the last:"))
         filter_row.addWidget(self.window_combo)
         filter_row.addWidget(QLabel("At least this many stars or likes:"))
@@ -2758,6 +3454,21 @@ class MainWindow(QMainWindow):
         self.results_empty_label.setStyleSheet("color: #9fb0cc;")
         layout.addWidget(self.results_empty_label)
 
+        # Find in these results (T55): narrowing 60 rows by a word
+        # costs no new search and no GitHub quota, like My List's
+        # "Find in this list".
+        results_filter_row = QHBoxLayout()
+        results_filter_row.addWidget(QLabel("Find in these results:"))
+        self.results_filter_box = QLineEdit()
+        self.results_filter_box.setPlaceholderText(
+            "Type to filter by title, description, or source")
+        self.results_filter_box.setToolTip(
+            "Type a few letters to keep only matching results.")
+        self.results_filter_box.textChanged.connect(
+            self._apply_results_filter)
+        results_filter_row.addWidget(self.results_filter_box, stretch=1)
+        layout.addLayout(results_filter_row)
+
         self.results_table = QTableWidget(0, len(RESULT_COLUMNS))
         self.results_table.setHorizontalHeaderLabels(RESULT_COLUMNS)
         self.results_table.setSelectionBehavior(
@@ -2772,7 +3483,7 @@ class MainWindow(QMainWindow):
         self.results_table.horizontalHeader().setSortIndicator(
             R_UPDATED, Qt.SortOrder.DescendingOrder)
         self.results_table.setAlternatingRowColors(True)
-        self.results_table.setMinimumHeight(220)
+        self.results_table.setMinimumHeight(180)
         self.results_table.horizontalHeader().setStretchLastSection(True)
         self.results_table.horizontalHeader().sortIndicatorChanged.connect(
             self._results_sorted)
@@ -2792,9 +3503,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.results_table, stretch=1)
 
         detail_box = QGroupBox("Details")
+        detail_box.setStyleSheet(
+            "QGroupBox { margin-top: 4px; padding-top: 4px; }")
         detail_layout = QVBoxLayout(detail_box)
+        detail_layout.setContentsMargins(6, 2, 6, 4)
         self.detail_view = QTextBrowser()
-        self.detail_view.setMaximumHeight(140)
+        # Links in the pane open in the browser (T49), in the
+        # theme's light blue so they read on the dark surface.
+        self.detail_view.setOpenExternalLinks(True)
+        self.detail_view.document().setDefaultStyleSheet(
+            "a { color: #7ee0ff; }")
+        # A smaller share (T31): the pane used to take 140 px and
+        # push the Add buttons below the fold at 1100x700.
+        self.detail_view.setMaximumHeight(80)
         detail_layout.addWidget(self.detail_view)
         layout.addWidget(detail_box)
         self._show_result_detail()
@@ -2812,7 +3533,7 @@ class MainWindow(QMainWindow):
         add_row.addWidget(self.add_all_button)
         self.stella_check_button = QPushButton("Check STELLA-ready")
         self.stella_check_button.setToolTip(
-            "Check the picked rows for files STELLA can use.")
+            "Check the picked rows, or every row when nothing is picked.")
         self.stella_check_button.clicked.connect(
             lambda: self.start_stella_check("results"))
         add_row.addWidget(self.stella_check_button)
@@ -2868,6 +3589,44 @@ class MainWindow(QMainWindow):
         self._results_sorting = True
         if section >= 0:
             self._results_sort = (section, order)
+        # Sorting moves items between visual rows, and row hiding
+        # follows the visual row, not the item: re-apply the
+        # filter so it keeps hiding the right rows (T55).
+        if hasattr(self, "results_filter_box"):
+            self._apply_results_filter()
+
+    def _save_search_filters(self):
+        """Remember the Active-only choice and window (T65)."""
+        config = core.load_config()
+        config["active_only"] = self.active_check.isChecked()
+        config["active_window"] = self.window_combo.currentText()
+        core.save_config(config)
+
+    def _apply_results_filter(self):
+        """Hide result rows that do not match the filter box (T55)."""
+        if self._showing_skeleton:
+            # Placeholder rows carry no item: leave them alone
+            # while the search runs.
+            return
+        text = self.results_filter_box.text().strip().lower()
+        for row in range(self.results_table.rowCount()):
+            cell = self.results_table.item(row, R_TITLE)
+            if cell is None:
+                continue
+            stored = cell.data(ROW_ROLE)
+            if not isinstance(stored, int) or stored >= len(self.results):
+                self.results_table.setRowHidden(row, True)
+                continue
+            if not text:
+                self.results_table.setRowHidden(row, False)
+                continue
+            item = self.results[stored]
+            hay = (f"{item.get('title', '')} "
+                   f"{item.get('description', '')} "
+                   f"{item.get('source', '')} "
+                   f"{item.get('url', '')}").lower()
+            self.results_table.setRowHidden(row, text not in hay)
+        self._update_results_empty_label()
 
     def _refresh_history_box(self):
         """Refill the search box drop-down from recent searches."""
@@ -2913,6 +3672,11 @@ class MainWindow(QMainWindow):
             return
         if self.search_worker is not None and self.search_worker.isRunning():
             return
+        if not self.search_box.currentText().strip():
+            # An empty box searches nothing (v0.1.4 T5): it used to
+            # run a search for the generic word "dataset".
+            self.statusBar().showMessage("Type a few words first.")
+            return
         category = self.selected_category()
         typed = self.search_box.currentText()
         query = core.build_query(typed, category)
@@ -2936,6 +3700,15 @@ class MainWindow(QMainWindow):
         if self._online is False:
             # Offline with nothing saved for this search: say so
             # instead of failing (T67). List work still works.
+            # The old rows go too (v0.1.4 T18): leaving the
+            # previous search's results under the new query reads
+            # as the new search's answer.
+            self.results = []
+            self._results_empty_note = (
+                "You are offline, and there is no saved search for "
+                "this yet. Try again when you are back online.")
+            self.load_more_button.setEnabled(False)
+            self._show_results()
             self.statusBar().showMessage(
                 "You are offline, and there is no saved search for "
                 "this yet. Try again when you are back online.")
@@ -3011,6 +3784,8 @@ class MainWindow(QMainWindow):
                 cell.setForeground(Qt.GlobalColor.gray)
                 table.setItem(row, col, cell)
         self._showing_skeleton = True
+        # A new search supersedes the last failure's note (T29).
+        self._results_empty_note = ""
         self.results_empty_label.setVisible(False)
 
     def _clear_skeleton(self):
@@ -3026,6 +3801,13 @@ class MainWindow(QMainWindow):
         empty = (self.results_table.rowCount() == 0
                  and not self._showing_skeleton)
         if empty:
+            if self._results_empty_note:
+                # A failed or offline search says so (v0.1.4
+                # T18/T29), instead of the never-searched hint.
+                self.results_empty_label.setText(
+                    self._results_empty_note)
+                self.results_empty_label.setVisible(True)
+                return
             # Never-searched and zero-results are different states
             # (T46, 031): a search that found nothing suggests
             # broadening, instead of repeating the first-run hint.
@@ -3036,7 +3818,21 @@ class MainWindow(QMainWindow):
             else:
                 self.results_empty_label.setText(
                     "No results yet. Type a few words and press Search.")
-        self.results_empty_label.setVisible(empty)
+            self.results_empty_label.setVisible(True)
+            return
+        # Rows exist but the filter hides every one (T55): say so,
+        # instead of showing an empty table with no explanation.
+        if (not self._showing_skeleton
+                and hasattr(self, "results_filter_box")
+                and self.results_filter_box.text().strip()
+                and all(self.results_table.isRowHidden(row)
+                        for row in range(self.results_table.rowCount()))):
+            self.results_empty_label.setText(
+                "No results match that filter. Clear the box to see "
+                "them all.")
+            self.results_empty_label.setVisible(True)
+            return
+        self.results_empty_label.setVisible(False)
 
     def _search_done(self, results: list[dict],
                      failures: list | None = None, cached: bool = False):
@@ -3049,6 +3845,7 @@ class MainWindow(QMainWindow):
         self._clear_skeleton()
         self._stop_search_clock()
         self._searched_once = True
+        self._results_empty_note = ""
         months = core.ACTIVE_WINDOWS[self.window_combo.currentText()]
         min_stars = int(self.stars_combo.currentText())
         license_filter = self.license_combo.currentData() or ""
@@ -3097,11 +3894,19 @@ class MainWindow(QMainWindow):
             # Only one source can have failed here (both failing takes
             # the error path); name it in plain words (U32).
             failed = failures[0][0]
-            other = "Hugging Face" if failed == "GitHub" else "GitHub"
-            message += (
-                f" {failed} search did not answer, "
-                f"showing {other} results only."
-            )
+            reason = failures[0][1] if len(failures[0]) > 1 else ""
+            if "did not accept that token" in reason:
+                # A rejected token is named on screen, in the
+                # log's own words (v0.1.4 T6): the cause and the
+                # fix are known, so hiding them behind "did not
+                # answer" leaves the user guessing.
+                message += f" {reason}"
+            else:
+                other = "Hugging Face" if failed == "GitHub" else "GitHub"
+                message += (
+                    f" {failed} search did not answer, "
+                    f"showing {other} results only."
+                )
         self.statusBar().showMessage(message)
         core.log(f"Search finished: {count} results after filters")
         self._refresh_checklist()
@@ -3113,6 +3918,10 @@ class MainWindow(QMainWindow):
         self.add_all_button.setEnabled(True)
         self.stella_check_button.setEnabled(True)
         self._set_busy(False)
+        # The results label says the search failed (v0.1.4 T29),
+        # instead of the never-searched text.
+        self._results_empty_note = (
+            "That search failed. Check the connection and try again.")
         self._clear_skeleton()
         self._stop_search_clock()
         self._refresh_rate()
@@ -3276,11 +4085,37 @@ class MainWindow(QMainWindow):
             # descending, and break the newest-first order.
             table.sortByColumn(*self._results_sort)
         table.resizeColumnsToContents()
-        # A long description must not shove the other columns off
-        # the window; the cell still shows the start of the text.
+        # A long title or description must not shove the other
+        # columns off the window; the cells still show the start
+        # of the text.
+        if table.columnWidth(R_TITLE) > 260:
+            table.setColumnWidth(R_TITLE, 260)
         if table.columnWidth(R_DESC) > 300:
             table.setColumnWidth(R_DESC, 300)
-        self._update_results_empty_label()
+        self._fit_results_columns()
+        # A typed filter applies to the fresh results too (T55);
+        # it refreshes the empty label as well.
+        self._apply_results_filter()
+
+    def _fit_results_columns(self):
+        """Shrink Description, then Title, until every column fits
+        the table's width (T31): STELLA and Score stay visible
+        without scrolling at the default size. Each keeps a floor
+        of 140 px, so the text stays readable."""
+        table = self.results_table
+        available = table.viewport().width() or table.width()
+        if available < 400:
+            return  # not laid out yet; the caps above still apply
+        total = sum(table.columnWidth(col)
+                    for col in range(len(RESULT_COLUMNS)))
+        over = total - available
+        for col, floor in ((R_DESC, 140), (R_TITLE, 140)):
+            if over <= 0:
+                break
+            give = min(over, table.columnWidth(col) - floor)
+            if give > 0:
+                table.setColumnWidth(col, table.columnWidth(col) - give)
+                over -= give
 
     def _selected_results(self) -> list[dict]:
         # Visual rows are not list indexes once the user sorts, so
@@ -3307,7 +4142,12 @@ class MainWindow(QMainWindow):
         menu.exec(self.results_table.viewport().mapToGlobal(pos))
 
     def start_stella_check(self, target: str):
-        """Check selected rows for STELLA-ready data files (T29)."""
+        """Check rows for STELLA-ready data files (T29).
+
+        With nothing selected, check everything (T51): the link
+        check already covers the whole list, and the old "Nothing
+        selected" refusal hid the Ctrl+A workaround nobody knew.
+        """
         if not self._require_online("Checking STELLA-ready"):
             return
         if self.stella_worker is not None and self.stella_worker.isRunning():
@@ -3329,8 +4169,13 @@ class MainWindow(QMainWindow):
             picked = [(row, self.my_list[row])
                       for row in self._selected_list_rows()]
         if not picked:
+            if target == "results":
+                picked = list(enumerate(self.results))
+            else:
+                picked = list(enumerate(self.my_list))
+        if not picked:
             self.statusBar().showMessage(
-                "Nothing selected. Click a row first.")
+                "Nothing to check yet.")
             return
         self._stella_target = target
         self._set_busy(True)
@@ -3401,6 +4246,12 @@ class MainWindow(QMainWindow):
                                 "total)")
                     stella.setToolTip(tip)
                 self.results_table.setItem(row, R_STELLA, stella)
+                # The score follows the badge (v0.1.4 T13): shape
+                # is one of its four parts, so a stale score and
+                # its "not checked yet" tooltip would contradict
+                # the badge in the next column.
+                self.results_table.setItem(row, R_SCORE,
+                                           _score_cell(item))
                 return
 
     def _stella_check_done(self, stopped: bool):
@@ -3420,17 +4271,34 @@ class MainWindow(QMainWindow):
                 f"{self._stella_total} checked."
             )
             return
-        # The completion moment (T57): how many of the checked
-        # datasets are STELLA-ready. The worker holds the same item
-        # dicts the check updated, so the count is this run's.
+        # The completion moment (T57): count what the check
+        # actually found (v0.1.4 T17). The worker holds the same
+        # item dicts the check updated, so the counts are this
+        # run's. Counting only "ready" read as failure when
+        # everything was convertible, and hid the failures.
         picked = [item for _index, item in self.stella_worker.items] \
             if self.stella_worker is not None else []
         ready = sum(1 for item in picked
                     if item.get("stella_status") == "ready")
-        word = "dataset" if len(picked) == 1 else "datasets"
+        convert = sum(1 for item in picked
+                      if item.get("stella_status") == "convert")
+        failed = sum(1 for item in picked
+                     if item.get("stella_status") == "unknown")
+        unusable = sum(1 for item in picked
+                       if item.get("stella_status")
+                       in ("none", "unsupported", "no-fields"))
+        needs_reader = sum(1 for item in picked
+                           if item.get("stella_status")
+                           == "needs-reader")
+        parts = [f"{ready} ready now", f"{convert} need conversion"]
+        if failed:
+            parts.append(f"{failed} could not be checked")
+        if unusable:
+            parts.append(f"{unusable} have no usable files")
+        if needs_reader:
+            parts.append(f"{needs_reader} need the Parquet reader")
         self._mark_finished(
-            f"STELLA check done: {ready} of {len(picked)} {word} "
-            "STELLA-ready.")
+            "STELLA check done: " + ", ".join(parts) + ".")
 
     def add_selected(self):
         chosen = self._selected_results()
@@ -3445,16 +4313,31 @@ class MainWindow(QMainWindow):
             added += 1 if was_added else 0
         self._save_list()
         self._refresh_list_tab()
-        self.statusBar().showMessage(f"Added {added} to My List.")
+        if added:
+            self.statusBar().showMessage(f"Added {added} to My List.")
+        else:
+            # Same honest line as Add all (T37): "Added 0"
+            # reports success for doing nothing.
+            self.statusBar().showMessage(
+                "Those links are already in My List.")
 
     def add_all_results(self):
+        if not self.results:
+            self.statusBar().showMessage(
+                "No results to add yet. Run a search first.")
+            return
         added = 0
         for item in self.results:
             self.my_list, was_added = core.add_to_list(self.my_list, item)
             added += 1 if was_added else 0
         self._save_list()
         self._refresh_list_tab()
-        self.statusBar().showMessage(f"Added {added} to My List.")
+        if added:
+            self.statusBar().showMessage(f"Added {added} to My List.")
+        else:
+            # "Added 0" reports success for doing nothing (T37).
+            self.statusBar().showMessage(
+                "Those results are already in My List.")
 
     def _open_result(self):
         chosen = self._selected_results()
@@ -3495,7 +4378,18 @@ class MainWindow(QMainWindow):
             lines.append(f"Format: {item['format']}")
         files = item.get("stella_files") or []
         if files:
-            lines.append("Files: " + ", ".join(files))
+            # Cap the file list like the STELLA tooltip does (T41):
+            # five files, one per line, then "and N more". The old
+            # code joined ALL files on ONE line: 178,948 chars for
+            # one dataset.
+            if len(files) <= 5:
+                lines.append("Files: " + ", ".join(files))
+            else:
+                lines.append("Files:")
+                lines.extend(f"  {name}" for name in files[:5])
+                rest = len(files) - 5
+                word = "file" if rest == 1 else "files"
+                lines.append(f"  and {rest} more {word}.")
             if item.get("stella_size"):
                 lines.append(
                     f"Size: {core.format_size(item['stella_size'])} total")
@@ -3504,9 +4398,16 @@ class MainWindow(QMainWindow):
                          "STELLA-ready to see the files.")
         if item.get("updated"):
             lines.append(f"Updated: {core.format_date(item['updated'])}")
+        # The link is clickable (T49): the pane renders HTML, so
+        # the address opens in the browser instead of needing a
+        # copy by hand. Everything else is escaped plain text.
+        body = "<br>".join(html.escape(line) for line in lines)
         if item.get("url"):
-            lines.append(f"Link: {item['url']}")
-        self.detail_view.setPlainText("\n".join(lines))
+            url = item["url"]
+            shown = html.escape(url)
+            body += (f"<br>Link: <a href=\"{html.escape(url, quote=True)}\">"
+                     f"{shown}</a>")
+        self.detail_view.setHtml(body)
 
     def _open_site(self, site: dict):
         query = core.build_query(
@@ -3523,12 +4424,22 @@ class MainWindow(QMainWindow):
             return
         if "://" not in url:
             url = "https://" + url
+        if not _looks_like_url(url):
+            # The dialog blocks this too; this is the second net
+            # (v0.1.4 T22): a link the check rejects is never added.
+            self.statusBar().showMessage(
+                "That does not look like a link. Check it.")
+            return
         item = {
             "title": self.found_title.text().strip() or url,
             "url": url,
             "category": core.category_key_for_label(
                 self.found_category.currentText()),
-            "source": "Found by hand",
+            # The source follows the URL (v0.1.4 T3): a pasted
+            # Hugging Face or GitHub link is checked and
+            # downloaded like a searched one, instead of being
+            # stuck as "Found by hand" forever.
+            "source": core.source_for_url(url),
             "stars": 0,
             "updated": "",
             "license": "",
@@ -3562,9 +4473,20 @@ class MainWindow(QMainWindow):
             "Your saved links. Double-click a row to open it. "
             "Export when the list is ready for STELLA."
         ))
-        format_note = QLabel(core.STELLA_FORMAT_NOTE)
+        format_note = QLabel(core.STELLA_FORMAT_NOTE_SHORT)
         format_note.setWordWrap(True)
         layout.addWidget(format_note)
+
+        # Add a link I found, reachable from My List too (T60):
+        # it used to live only on the Search tab, below the fold.
+        add_link_row = QHBoxLayout()
+        self.list_add_link_button = QPushButton("Add a link I found")
+        self.list_add_link_button.setToolTip(
+            "Add a link you found yourself to My List.")
+        self.list_add_link_button.clicked.connect(self.show_add_link_dialog)
+        add_link_row.addWidget(self.list_add_link_button)
+        add_link_row.addStretch(1)
+        layout.addLayout(add_link_row)
 
         # Collections (T30): named lists, one active at a time.
         collection_row = QHBoxLayout()
@@ -3693,13 +4615,20 @@ class MainWindow(QMainWindow):
         self.stop_check_button.setEnabled(False)
         self.stop_check_button.clicked.connect(self.stop_link_check)
         row.addWidget(self.stop_check_button)
+        self.remove_dead_button = QPushButton("Remove the dead ones")
+        self.remove_dead_button.setToolTip(
+            "Remove every row the link check marked dead.")
+        self.remove_dead_button.setEnabled(False)
+        self.remove_dead_button.clicked.connect(self.remove_dead)
+        row.addWidget(self.remove_dead_button)
         self.copy_button = QPushButton("Copy all links")
         self.copy_button.setToolTip(
             "Copy every link in My List to the clipboard.")
         self.copy_button.clicked.connect(self.copy_all_links)
         row.addWidget(self.copy_button)
         row.addStretch(1)
-        self.remove_section = CollapsibleSection("Remove and check")
+        self.remove_section = CollapsibleSection(
+            "Remove and check", key="list-remove")
         self.remove_section.set_content_layout(row)
         layout.addWidget(self.remove_section)
 
@@ -3709,9 +4638,15 @@ class MainWindow(QMainWindow):
             "Change the title, category, notes, or state of one link.")
         self.edit_button.clicked.connect(self.edit_selected)
         action_row.addWidget(self.edit_button)
+        self.undo_edit_button = QPushButton("Undo edit")
+        self.undo_edit_button.setToolTip(
+            "Undo the last change made in the Edit window.")
+        self.undo_edit_button.setEnabled(False)
+        self.undo_edit_button.clicked.connect(self.undo_edit)
+        action_row.addWidget(self.undo_edit_button)
         self.list_stella_button = QPushButton("Check STELLA-ready")
         self.list_stella_button.setToolTip(
-            "Check the picked rows for files STELLA can use.")
+            "Check the picked rows, or every row when nothing is picked.")
         self.list_stella_button.clicked.connect(
             lambda: self.start_stella_check("list"))
         action_row.addWidget(self.list_stella_button)
@@ -3737,7 +4672,8 @@ class MainWindow(QMainWindow):
         self.queue_button.clicked.connect(self.show_queue)
         action_row.addWidget(self.queue_button)
         action_row.addStretch(1)
-        self.edit_section = CollapsibleSection("Edit and convert")
+        self.edit_section = CollapsibleSection(
+            "Edit and convert", key="list-edit")
         self.edit_section.set_content_layout(action_row)
         layout.addWidget(self.edit_section)
 
@@ -3772,7 +4708,8 @@ class MainWindow(QMainWindow):
         self.send_button.clicked.connect(self.send_to_stella)
         export_row.addWidget(self.send_button)
         export_row.addStretch(1)
-        self.export_section = CollapsibleSection("Export")
+        self.export_section = CollapsibleSection(
+            "Export", key="list-export")
         self.export_section.set_content_layout(export_row)
         layout.addWidget(self.export_section)
         layout.addWidget(_explain(
@@ -3838,6 +4775,8 @@ class MainWindow(QMainWindow):
         self._note_list_loaded()
         self._undo_stack.clear()
         self.undo_button.setEnabled(False)
+        self._edit_undo_stack.clear()
+        self.undo_edit_button.setEnabled(False)
         self._refresh_list_tab()
         self.statusBar().showMessage(f"Switched to {name}.")
 
@@ -3921,6 +4860,8 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage(
+                f"Kept the list {self._active_collection}.")
             return
         data = core.load_list_data()
         data["collections"] = [col for col in data["collections"]
@@ -3933,10 +4874,73 @@ class MainWindow(QMainWindow):
         self._note_list_loaded()
         self._undo_stack.clear()
         self.undo_button.setEnabled(False)
+        self._edit_undo_stack.clear()
+        self.undo_edit_button.setEnabled(False)
         self._refresh_collection_combo()
         self._refresh_list_tab()
         self.statusBar().showMessage(
             f"Deleted the list. Now showing {new_active}.")
+
+    def move_selected_to_collection(self, name: str):
+        """Move the selected rows to another list (T63).
+
+        A link saved to the wrong list is no longer stuck there.
+        The move is one save: the rows leave this list and join
+        the other, skipping links the other list already holds.
+        """
+        if self._check_running():
+            self.statusBar().showMessage(
+                "Wait for the check to finish first.")
+            return
+        if not name or name == self._active_collection:
+            return
+        _active, names = core.load_collections()
+        if name not in names:
+            return
+        rows = self._selected_list_rows()
+        if not rows:
+            self.statusBar().showMessage("Nothing selected to move.")
+            return
+        moved = [self.my_list[row] for row in rows]
+        keep = {row for row in rows}
+        self.my_list = [item for index, item in enumerate(self.my_list)
+                        if index not in keep]
+        data = core.load_list_data()
+        # Save the reduced list first (the _switch_collection
+        # order): _save_active_items merges in anything added on
+        # disk since this window loaded.
+        self._save_active_items(data)
+        added = 0
+        for col in data["collections"]:
+            if col["name"] != name:
+                continue
+            target = col.get("items") or []
+            keys = {core.normalize_url(entry.get("url") or "")
+                    for entry in target if isinstance(entry, dict)}
+            for item in moved:
+                key = core.normalize_url(item.get("url") or "")
+                if key and key not in keys:
+                    target.append(core.normalize_item(item))
+                    keys.add(key)
+                    added += 1
+            col["items"] = target
+        if not self._save_collections(self._active_collection,
+                                      data["collections"]):
+            # The save failed: put the rows back where they were
+            # instead of losing them.
+            for row, item in sorted(zip(rows, moved)):
+                self.my_list.insert(min(row, len(self.my_list)), item)
+            self._refresh_list_tab()
+            return
+        self._refresh_list_tab()
+        word = "link" if added == 1 else "links"
+        if added < len(moved):
+            skipped = len(moved) - added
+            self.statusBar().showMessage(
+                f"Moved {added} {word} to {name}. {skipped} "
+                f"{'was' if skipped == 1 else 'were'} already there.")
+        else:
+            self.statusBar().showMessage(f"Moved {added} {word} to {name}.")
 
     # ------------------------------------------------------------ list filter (T19, T30)
 
@@ -4004,6 +5008,10 @@ class MainWindow(QMainWindow):
                             "total)")
                 stella_cell.setToolTip(tip)
             table.setItem(row, L_STELLA, stella_cell)
+            # The quality score (T57): computed from the same fields
+            # the search table scores, so it stays in step with the
+            # result the link came from, and with the STELLA check.
+            table.setItem(row, L_SCORE, _score_cell(item))
         if not self._list_sorting:
             # Clear the indicator BEFORE re-enabling sorting, or the
             # re-enable re-sorts by the stale column.
@@ -4015,13 +5023,29 @@ class MainWindow(QMainWindow):
         # off the window; the cell still shows the start of it.
         if table.columnWidth(L_LINK) > 320:
             table.setColumnWidth(L_LINK, 320)
+        # One long title did the same (T32): cap Title the way
+        # Link already is, and Notes with it.
+        if table.columnWidth(L_TITLE) > 320:
+            table.setColumnWidth(L_TITLE, 320)
+        if table.columnWidth(L_NOTES) > 200:
+            table.setColumnWidth(L_NOTES, 200)
         self.tabs.setTabText(
             self.list_tab_index, f"My List ({len(self.my_list)})"
         )
         self.list_empty_label.setVisible(len(self.my_list) == 0)
+        self._refresh_dead_button()
         self._apply_list_filter()
         self._refresh_stats()
         self._refresh_checklist()
+
+    def _refresh_dead_button(self):
+        """Enable "Remove the dead ones" only when the check has
+        actually marked rows dead (T62), and no check is running."""
+        if not hasattr(self, "remove_dead_button"):
+            return
+        self.remove_dead_button.setEnabled(
+            any(item.get("status") == "dead" for item in self.my_list)
+            and not self._check_running())
 
     def _selected_list_rows(self) -> list[int]:
         # Visual rows are not list indexes once the user sorts, so
@@ -4045,6 +5069,15 @@ class MainWindow(QMainWindow):
         rows = self._selected_list_rows()
         if not rows:
             return
+        menu = self._build_list_context_menu(rows)
+        menu.exec(self.list_table.viewport().mapToGlobal(pos))
+
+    def _build_list_context_menu(self, rows: list[int]) -> QMenu:
+        """The right-click menu for the selected list rows.
+
+        Built separately from showing it, so the entries can be
+        checked without opening a modal menu.
+        """
         menu = QMenu(self)
         menu.addAction("Open in browser", self._open_list_item)
         menu.addAction("Edit", self.edit_selected)
@@ -4053,10 +5086,77 @@ class MainWindow(QMainWindow):
         for key, label in core.WORKFLOW_STATES.items():
             mark.addAction(
                 label, lambda _checked=False, k=key: self._mark_state(k))
+        # A way back to the converted files (T56): only when this
+        # row's conversion folder holds .jsonl files.
+        if len(rows) == 1:
+            item = self.my_list[rows[0]]
+            files = self._converted_files(item)
+            if files:
+                if len(files) == 1:
+                    menu.addAction(
+                        "Open converted file",
+                        lambda _checked=False, p=files[0]:
+                            self._open_converted_file(p))
+                else:
+                    open_menu = menu.addMenu("Open converted file")
+                    for path in files:
+                        open_menu.addAction(
+                            path.name,
+                            lambda _checked=False, p=path:
+                                self._open_converted_file(p))
+                menu.addAction(
+                    "Open converted folder",
+                    lambda _checked=False, it=item:
+                        self._open_converted_folder(it))
+        # Move between collections (T63): only when another list
+        # exists to move to.
+        _active, names = core.load_collections()
+        others = [name for name in names
+                  if name != self._active_collection]
+        if others:
+            move = menu.addMenu("Move to list")
+            for name in others:
+                move.addAction(
+                    name, lambda _checked=False, n=name:
+                        self.move_selected_to_collection(n))
         menu.addAction("Move up", lambda: self._move_selected(-1))
         menu.addAction("Move down", lambda: self._move_selected(1))
         menu.addAction("Remove", self.remove_selected)
-        menu.exec(self.list_table.viewport().mapToGlobal(pos))
+        return menu
+
+    def _converted_folder(self, item: dict) -> Path:
+        """Where this item's converted files live (T56).
+
+        The same folder download_and_convert writes into, derived
+        from the title, source, and URL, so it needs no stored path.
+        """
+        return (core.home_dir() / "stella-ready"
+                / download.dataset_folder_name(item))
+
+    def _converted_files(self, item: dict) -> list[Path]:
+        """The converted .jsonl files for one item, if any (T56)."""
+        folder = self._converted_folder(item)
+        if not folder.is_dir():
+            return []
+        return sorted(folder.glob("*.jsonl"))
+
+    def _open_converted_file(self, path: Path):
+        """Open one converted .jsonl with the system's viewer."""
+        if path.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        else:
+            self.statusBar().showMessage(
+                "That file is gone. Convert the dataset again to "
+                "make it.")
+
+    def _open_converted_folder(self, item: dict):
+        """Open the folder with an item's converted files (T56)."""
+        folder = self._converted_folder(item)
+        if folder.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        else:
+            self.statusBar().showMessage(
+                "There are no converted files for that link yet.")
 
     def _copy_selected_link(self):
         rows = self._selected_list_rows()
@@ -4160,6 +5260,9 @@ class MainWindow(QMainWindow):
                                 "total)")
                     stella.setToolTip(tip)
                 self.list_table.setItem(row, L_STELLA, stella)
+                # The score follows the STELLA check too (T57):
+                # shape is one of its four parts.
+                self.list_table.setItem(row, L_SCORE, _score_cell(item))
                 return
 
     def edit_selected(self):
@@ -4169,18 +5272,60 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Nothing selected to edit.")
             return
         item = self.my_list[rows[0]]
-        dialog = EditItemDialog(item, self)
+        taken = [other.get("url") or ""
+                 for index, other in enumerate(self.my_list)
+                 if index != rows[0]]
+        dialog = EditItemDialog(item, self, taken_urls=taken)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
+        # Undo for edits (T59): the item as it was, before the
+        # change lands. Only a real change is undoable.
+        before = copy.deepcopy(item)
         if values["title"]:
             item["title"] = values["title"]
+        # A fixed link (T58): the same https:// repair the add
+        # form applies, so a bare host stays a working link.
+        new_url = (values.get("url") or "").strip()
+        if new_url and "://" not in new_url:
+            new_url = "https://" + new_url
+        if new_url:
+            item["url"] = new_url
         item["category"] = values["category"]
         item["notes"] = values["notes"]
         item["state"] = values["state"]
+        if item != before:
+            self._edit_undo_stack.append(
+                (before, core.normalize_url(item.get("url") or "")))
+            self.undo_edit_button.setEnabled(True)
         self._save_list()
         self._refresh_list_tab()
         self.statusBar().showMessage("Saved the changes.")
+
+    def undo_edit(self):
+        """Undo the last edit: title, link, category, notes, or
+        state goes back to what it was (T59)."""
+        if self._check_running():
+            self.statusBar().showMessage(
+                "Wait for the check to finish first.")
+            return
+        if not self._edit_undo_stack:
+            return
+        before, after_url = self._edit_undo_stack.pop()
+        self.undo_edit_button.setEnabled(bool(self._edit_undo_stack))
+        # Find the edited row again by its after-edit link: the
+        # list may have moved since the edit. No position fallback:
+        # another row may sit in the old slot now, and undo must
+        # never overwrite the wrong link.
+        index = self._find_list_index(after_url) if after_url else -1
+        if index < 0:
+            self.statusBar().showMessage(
+                "That link is gone. Nothing to undo.")
+            return
+        self.my_list[index] = before
+        self._save_list()
+        self._refresh_list_tab()
+        self.statusBar().showMessage("Edit undone.")
 
     def remove_selected(self):
         if self._check_running():
@@ -4199,6 +5344,10 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
+            # Say what was kept (T35): leaving the previous
+            # message would describe something the user did not do.
+            self.statusBar().showMessage(
+                f"Kept {len(rows)} {word} in My List.")
             return
         removed = [(row, self.my_list[row]) for row in rows]
         self._undo_stack.append(removed)
@@ -4232,6 +5381,11 @@ class MainWindow(QMainWindow):
                 "Wait for the check to finish first.")
             return
         if not self.my_list:
+            # An enabled button that silently does nothing looks
+            # broken (T34): say so, like every other empty-state
+            # button does.
+            self.statusBar().showMessage(
+                "My List is empty. Nothing to clear.")
             return
         answer = QMessageBox.question(
             self, "Clear My List",
@@ -4240,6 +5394,10 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
+            count = len(self.my_list)
+            word = "link" if count == 1 else "links"
+            self.statusBar().showMessage(
+                f"Kept My List as it is ({count} {word}).")
             return
         self._undo_stack.append(
             [(row, item) for row, item in enumerate(self.my_list)])
@@ -4248,6 +5406,45 @@ class MainWindow(QMainWindow):
         self._save_list()
         self._refresh_list_tab()
         self.statusBar().showMessage("My List is empty now.")
+
+    def remove_dead(self):
+        """Remove every row the link check marked dead (T62).
+
+        The obvious next step after "2 dead": one action instead
+        of picking the rows one by one. Undo remove brings them
+        back, like any other removal.
+        """
+        if self._check_running():
+            self.statusBar().showMessage(
+                "Wait for the check to finish first.")
+            return
+        rows = [index for index, item in enumerate(self.my_list)
+                if item.get("status") == "dead"]
+        if not rows:
+            self.statusBar().showMessage(
+                "No dead links in My List.")
+            return
+        word = "link" if len(rows) == 1 else "links"
+        answer = QMessageBox.question(
+            self, "Remove the dead ones",
+            f"Remove {len(rows)} dead {word} from My List?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage(
+                f"Kept {len(rows)} dead {word} in My List.")
+            return
+        removed = [(row, self.my_list[row]) for row in rows]
+        self._undo_stack.append(removed)
+        self.undo_button.setEnabled(True)
+        keep = {row for row in rows}
+        self.my_list = [item for index, item in enumerate(self.my_list)
+                        if index not in keep]
+        self._save_list()
+        self._refresh_list_tab()
+        self.statusBar().showMessage(
+            f"Removed {len(rows)} dead {word} from My List.")
 
     def start_link_check(self):
         if not self.my_list:
@@ -4279,7 +5476,7 @@ class MainWindow(QMainWindow):
         self.check_worker.start()
 
     def stop_link_check(self):
-        """Stop the link check after the link it is on now (U26)."""
+        """Stop the link check at once (U26, v0.1.4 T27)."""
         if self.check_worker is not None and self.check_worker.isRunning():
             self.check_worker.request_stop()
             self.stop_check_button.setEnabled(False)
@@ -4365,7 +5562,7 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             core.log_error(f"Export failed: {exc}")
             QMessageBox.warning(self, "Export failed",
-                                f"Could not write the file: {exc}")
+                                _plain_write_error(exc))
             return
         core.log(f"Exported {len(self.my_list)} items as {fmt} to {path}")
         self.statusBar().showMessage(f"Exported {len(self.my_list)} links.")
@@ -4383,7 +5580,8 @@ class MainWindow(QMainWindow):
             items = core.import_file_text(text)
         except (OSError, ValueError) as exc:
             core.log_error(f"Import failed: {exc}")
-            QMessageBox.warning(self, "Import failed", str(exc))
+            QMessageBox.warning(self, "Import failed",
+                                _plain_read_error(exc))
             return
         added = 0
         for item in items:
@@ -4421,7 +5619,7 @@ class MainWindow(QMainWindow):
             core.log_error(f"Send to STELLA failed: {exc}")
             QMessageBox.warning(
                 self, "Send to STELLA failed",
-                f"Could not write the file: {exc}")
+                _plain_write_error(exc))
             return
         core.log(f"Sent {len(self.my_list)} items to STELLA at {path}")
         self.statusBar().showMessage(
@@ -4491,6 +5689,12 @@ class MainWindow(QMainWindow):
     def watch_current_search(self):
         """Save the search in the box as a watch (opt-in)."""
         typed = self.search_box.currentText().strip()
+        if not typed:
+            # An empty box watches nothing (v0.1.4 T5): it used to
+            # silently create a persistent watch for the generic
+            # word "dataset", re-running every 30 minutes.
+            self.statusBar().showMessage("Type a few words first.")
+            return
         category = self.selected_category()
         query = core.build_query(typed, category)
         watches = watch.load_watches()
@@ -4529,6 +5733,12 @@ class MainWindow(QMainWindow):
         if self.watch_worker is not None and self.watch_worker.isRunning():
             return
         if self._online is False:
+            # A forced run is a button press (T46): silence reads
+            # as a dead button, so say the run is waiting.
+            if force:
+                self.statusBar().showMessage(
+                    "You are offline. Watched searches wait until "
+                    "you are back online.")
             return
         watches = watch.load_watches()
         if force:
@@ -4537,6 +5747,9 @@ class MainWindow(QMainWindow):
         else:
             due = watch.due_watches(watches)
         if not due:
+            if force:
+                self.statusBar().showMessage(
+                    "No watched searches to check right now.")
             return
         import copy
 
@@ -4613,6 +5826,33 @@ class MainWindow(QMainWindow):
     def _queue_closed(self, _result=None):
         self._queue_dialog = None
 
+    def show_history(self):
+        """Open the download history window (T61)."""
+        if self._history_dialog is None:
+            self._history_dialog = HistoryDialog(self)
+            self._history_dialog.finished.connect(self._history_closed)
+        else:
+            self._history_dialog.refresh()
+        self._history_dialog.show()
+        self._history_dialog.raise_()
+        self._history_dialog.activateWindow()
+
+    def _history_closed(self, _result=None):
+        self._history_dialog = None
+
+    def show_selftest(self):
+        """Open the self-test window and run it (T64)."""
+        if self._selftest_dialog is None:
+            self._selftest_dialog = SelfTestDialog(self)
+            self._selftest_dialog.finished.connect(self._selftest_closed)
+        self._selftest_dialog.show()
+        self._selftest_dialog.raise_()
+        self._selftest_dialog.activateWindow()
+        self._selftest_dialog.start_test()
+
+    def _selftest_closed(self, _result=None):
+        self._selftest_dialog = None
+
     # ------------------------------------------------------------ local convert (T67)
 
     def convert_local_file(self):
@@ -4629,9 +5869,17 @@ class MainWindow(QMainWindow):
             return
         source = Path(path)
         out_dir = core.home_dir() / "stella-ready"
-        out_path = out_dir / (source.stem + ".jsonl")
+        # Folder-qualified output names (v0.1.4 T1), the same as
+        # the download path: folder-a/train.jsonl and
+        # folder-b/train.jsonl become folder-a-train.jsonl and
+        # folder-b-train.jsonl, so the second convert never
+        # destroys the first file's rows.
+        display = (f"{source.parent.name}/{source.name}"
+                   if source.parent.name else source.name)
+        out_path = out_dir / download.output_name(display)
         try:
-            ok, message, rows = download._convert_file(source, out_path)
+            ok, message, rows = download._convert_file(
+                source, out_path, display)
         except Exception as exc:  # noqa: BLE001 - a bad file is a message, not a crash
             core.log_error(f"Local convert failed: {exc}")
             QMessageBox.warning(self, "Convert failed",
@@ -4641,8 +5889,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Convert failed", message)
             return
         core.log(f"Converted a local file: {source} -> {out_path}")
+        # The download history (T61): a local convert counts too.
+        try:
+            history.record_conversion(
+                source.name, "", "File on this PC", rows, [out_path])
+        except OSError as exc:
+            core.log_error(f"Could not record the download: {exc}")
         self.statusBar().showMessage(
-            f"Converted {source.name}: {rows} rows in {out_path.name}.")
+            f"Converted {display}: {rows} rows in {out_path.name}.")
         if core.stella_home() is not None:
             answer = QMessageBox.question(
                 self, "Add it to a STELLA project?",
@@ -4664,6 +5918,14 @@ class MainWindow(QMainWindow):
             "Websites to search on. Each one opens the same search "
             "in your browser from the Search tab."
         ))
+        # Empty state (T46, 031): guidance when every site is gone.
+        # Above the table (T54): the guidance is the useful part,
+        # and it used to sit below a large dead box.
+        self.sources_empty_label = QLabel(
+            "No websites here. Add one below, or restore the defaults.")
+        self.sources_empty_label.setStyleSheet("color: #9fb0cc;")
+        self.sources_empty_label.setWordWrap(True)
+        layout.addWidget(self.sources_empty_label)
         self.sources_table = QTableWidget(0, 3)
         self.sources_table.setHorizontalHeaderLabels(
             ["Website", "Address", "Remove"])
@@ -4671,13 +5933,15 @@ class MainWindow(QMainWindow):
             QAbstractItemView.SelectionBehavior.SelectRows)
         self.sources_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.sources_table.horizontalHeader().setStretchLastSection(True)
+        # The Remove column is sized to its button (T39): the old
+        # stretchLastSection gave it ~60% of the table while the
+        # addresses the user needs to read were squeezed.
+        header = self.sources_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.sources_table, stretch=1)
-        # Empty state (T46, 031): guidance when every site is gone.
-        self.sources_empty_label = QLabel(
-            "No websites here. Add one below, or restore the defaults.")
-        self.sources_empty_label.setStyleSheet("color: #9fb0cc;")
-        layout.addWidget(self.sources_empty_label)
 
         add_box = QGroupBox("Add a website")
         add_layout = QFormLayout(add_box)
@@ -4865,8 +6129,17 @@ class MainWindow(QMainWindow):
             return
         self.site_name.clear()
         self.site_url.clear()
-        self._validate_site_name()
-        self._validate_site_url()
+        # The cleared form is a fresh form (v0.1.4 T8): clear()
+        # leaves the modified flag set, so re-validating here
+        # showed red "Give the website a name." errors under a
+        # success message. Reset the flags and hide any errors
+        # instead of validating.
+        self.site_name.setModified(False)
+        self.site_url.setModified(False)
+        self.site_name_error.setText("")
+        self.site_name_error.setVisible(False)
+        self.site_url_error.setText("")
+        self.site_url_error.setVisible(False)
         self._refresh_sources_table()
         self._refresh_site_buttons()
         self.statusBar().showMessage(f"Added {name}.")
@@ -4886,6 +6159,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage(f"Kept {name}.")
             return
         removed = sites.pop(position)
         if not self._try_save(
@@ -4930,6 +6204,8 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage(
+                "Kept your websites as they are.")
             return
         if not self._try_save(
                 core.restore_default_sources,
@@ -4945,16 +6221,24 @@ class MainWindow(QMainWindow):
 
     def save_token(self):
         # Advisory only: a token the check does not recognise
-        # still saves (044 never blocks on a guess).
-        self._validate_token(force=True)
+        # still saves (044 never blocks on a guess). But the
+        # status line says so in one honest line (v0.1.4 T21):
+        # claiming plain success while the field shows a red
+        # error was a contradiction.
+        valid = self._validate_token(force=True)
         if not self._try_save(
                 lambda: core.set_github_token(self.token_field.text()),
                 "Could not save the token",
                 "Could not save the token. Try again."):
             return
-        self.statusBar().showMessage(
-            "Token saved on this PC. It is never written to a log."
-        )
+        error = self.token_error.text().strip()
+        if not valid and error:
+            lowered = error[0].lower() + error[1:]
+            self.statusBar().showMessage(f"Saved, but {lowered}")
+        else:
+            self.statusBar().showMessage(
+                "Token saved on this PC. It is never written to a log."
+            )
         self._refresh_checklist()
 
     def copy_debug_report(self):

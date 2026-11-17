@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus, urlsplit, urlunsplit
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 APP_NAME = "Dataset Scout"
 
@@ -34,6 +34,14 @@ STELLA_FORMAT_NOTE = (
     "\"content\"}, ...]}, one format per file, at least 2 rows. "
     "Download and convert in Dataset Scout writes that shape into "
     "a stella-ready folder."
+)
+
+# The same note in plain words for the top of My List (v0.1.4
+# T28): the schema above is for an export file, not for a person
+# reading the tab.
+STELLA_FORMAT_NOTE_SHORT = (
+    "STELLA learns from simple question-and-answer files. "
+    "Download and convert makes those files for you."
 )
 
 # ---------------------------------------------------------------- home dir
@@ -129,6 +137,9 @@ STELLA_STATUS_LABELS = {
     # compressed-only): the check worked, conversion is the
     # missing part (v0.1.3 T26/T34).
     "unsupported": "Cannot convert",
+    # The check ran and the files have no fields Scout can map
+    # (v0.1.4 T12): a final answer, not a failed check.
+    "no-fields": "No usable fields",
 }
 
 # Workflow states for a saved link (T30).
@@ -246,6 +257,31 @@ def build_query(text: str, category: str) -> str:
     if suffix:
         return suffix
     return "dataset"
+
+
+def source_for_url(url: str) -> str:
+    """The source of a link, from its address (v0.1.4 T3).
+
+    A Hugging Face dataset link is "Hugging Face" and a GitHub
+    link is "GitHub", so a pasted link is checked and downloaded
+    like a searched one; anything else stays "Found by hand" (a
+    direct link to a data file downloads through the direct
+    branch either way).
+    """
+    text = (url or "").strip()
+    if "://" not in text:
+        text = "https://" + text
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return "Found by hand"
+    host = (parts.hostname or "").lower()
+    if host in ("huggingface.co", "www.huggingface.co") \
+            and "/datasets/" in parts.path:
+        return "Hugging Face"
+    if host in ("github.com", "www.github.com"):
+        return "GitHub"
+    return "Found by hand"
 
 
 # ---------------------------------------------------------------- dates
@@ -692,6 +728,22 @@ def _read_list_file() -> dict:
                         "recovered).")
                 _note_list_load(note)
                 log(note, level="WARNING")
+                # A persistent record (T53): the status-bar notice
+                # is gone with the next status update, so the
+                # recovery is also kept in the config, where the
+                # About box can show it. One record per incident:
+                # the same damaged file loads several times at
+                # startup, and re-stamping the date each time
+                # would rewrite history.
+                config = load_config()
+                record = config.get("list_recovered")
+                if (not isinstance(record, dict)
+                        or record.get("links") != count):
+                    config["list_recovered"] = {
+                        "date": datetime.now(timezone.utc).isoformat(),
+                        "links": count,
+                    }
+                    save_config(config)
                 return recovered
         note = ("The saved list was damaged and could not be read, "
                 "so Dataset Scout started with an empty list.")
@@ -1286,6 +1338,35 @@ def log_error(message: str, exc: BaseException | None = None) -> None:
         log(message, level="ERROR")
 
 
+def _log_tail_lines(limit: int = _RING_MAX) -> list[str]:
+    """The last `limit` log lines from the log files on disk,
+    oldest first (v0.1.4 T7).
+
+    The on-disk log is what a user reporting a problem from a
+    previous session needs; the in-memory ring only covers this
+    run. Falls back to the ring when no log file can be read, and
+    says so when there are no log lines at all.
+    """
+    logs_dir = home_dir() / "logs"
+    tail: list[str] = []
+    if logs_dir.is_dir():
+        for path in sorted(logs_dir.glob("scout-*.log"), reverse=True):
+            if len(tail) >= limit:
+                break
+            try:
+                lines = path.read_text(encoding="utf-8",
+                                       errors="replace").splitlines()
+            except OSError:
+                continue
+            take = lines[-(limit - len(tail)):]
+            tail = take + tail
+    if tail:
+        return tail
+    if _RING:
+        return list(_RING)
+    return ["(No log lines yet.)"]
+
+
 def debug_report() -> str:
     """A scrubbed report of the recent log, safe to share."""
     lines = [
@@ -1294,7 +1375,7 @@ def debug_report() -> str:
         "",
         "Recent log (newest last):",
     ]
-    lines.extend(_RING)
+    lines.extend(_log_tail_lines())
     return scrub_token("\n".join(lines) + "\n")
 
 

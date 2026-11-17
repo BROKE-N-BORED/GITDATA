@@ -180,5 +180,107 @@ class ParquetSniffTests(unittest.TestCase):
         self.assertEqual(result["status"], "convert")
 
 
+class _RangeResponse:
+    """A fake HTTP response serving byte ranges of one file."""
+
+    def __init__(self, body, status=200, headers=None):
+        self._body = body
+        self.status = status
+        self.headers = headers or {}
+
+    def read(self, size=-1):
+        return self._body if size is None or size < 0 else self._body[:size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _range_server(data, advertise_size=True):
+    """A fake urlopen that serves HEAD and Range GETs of data."""
+    fetched = []
+
+    def fake_urlopen(request, timeout=None):
+        method = request.get_method()
+        if method == "HEAD":
+            headers = {}
+            if advertise_size:
+                headers["Content-Length"] = str(len(data))
+            return _RangeResponse(b"", 200, headers)
+        range_header = request.get_header("Range")
+        if range_header and range_header.startswith("bytes="):
+            start, _, end = range_header[6:].partition("-")
+            start = int(start or 0)
+            end = int(end) if end else len(data) - 1
+            body = data[start:end + 1]
+            fetched.append((start, end))
+            return _RangeResponse(
+                body, 206,
+                {"Content-Length": str(len(body)),
+                 "Content-Range":
+                     f"bytes {start}-{end}/{len(data)}"})
+        fetched.append((0, len(data) - 1))
+        return _RangeResponse(data, 200,
+                              {"Content-Length": str(len(data))})
+
+    fake_urlopen.fetched = fetched
+    return fake_urlopen
+
+
+@unittest.skipUnless(HAVE_PYARROW, "pyarrow is not installed")
+class RemoteColumnsTests(unittest.TestCase):
+    # v0.1.4 T10: the Parquet peek reads only the footer over
+    # HTTP Range requests — never the rows.
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _data(self, rows, name="data.parquet"):
+        path = self.dir / name
+        _write_parquet(path, rows)
+        return path.read_bytes()
+
+    def test_reads_column_names_without_the_rows(self):
+        # The rows are long random text, so the data section is
+        # far bigger than the footer: a footer-only peek fetches
+        # a fraction of the file. (A tiny file fits in one
+        # pyarrow read, so a small fixture cannot prove this.)
+        import random
+        big_text = "".join(
+            random.Random(7).choices("abcdefghij0123456789",
+                                     k=200000))
+        data = self._data(
+            [{"question": "2+2?", "ground_truth": "4",
+              "text": big_text}])
+        server = _range_server(data)
+        with unittest.mock.patch("urllib.request.urlopen", server):
+            columns = parquet.read_remote_columns(
+                "https://example.com/data.parquet")
+        self.assertEqual(columns, ["question", "ground_truth", "text"])
+        fetched = sum(end - start + 1 for start, end in server.fetched)
+        self.assertLess(fetched, len(data) // 2)
+
+    def test_unknown_size_is_a_plain_error(self):
+        data = self._data([{"prompt": "a", "completion": "b"}])
+        server = _range_server(data, advertise_size=False)
+        with unittest.mock.patch("urllib.request.urlopen", server):
+            with self.assertRaises(parquet.ParquetError) as caught:
+                parquet.read_remote_columns(
+                    "https://example.com/data.parquet")
+        self.assertIn("could not read", str(caught.exception).lower())
+
+    def test_unreadable_footer_is_a_plain_error(self):
+        server = _range_server(b"not a parquet file at all")
+        with unittest.mock.patch("urllib.request.urlopen", server):
+            with self.assertRaises(parquet.ParquetError):
+                parquet.read_remote_columns(
+                    "https://example.com/data.parquet")
+
+
 if __name__ == "__main__":
     unittest.main()

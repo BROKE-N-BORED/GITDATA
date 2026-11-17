@@ -292,6 +292,25 @@ def link_dataset(jsonl_path: Path | str, profile: str, project: str,
                 f"dataset {current_ref!r}. Pick another project, or "
                 "choose to replace its dataset.")
             return result
+        if current_ref == dataset_name and not replace:
+            # The same-name case (v0.1.4 T2): the project already
+            # holds a dataset file under this name, so compare
+            # contents, not names. A different file is refused
+            # unless the user chose to replace; the same file
+            # links again harmlessly, and a missing file means
+            # there is nothing to protect.
+            try:
+                same = (dataset_path.is_file()
+                        and dataset_path.read_bytes()
+                        == jsonl_path.read_bytes())
+            except OSError:
+                same = False
+            if dataset_path.is_file() and not same:
+                result["message"] = (
+                    f"The project {project_slug!r} already holds a "
+                    "different dataset. Pick another project, or "
+                    "choose to replace its dataset.")
+                return result
 
     backup_path = None
     try:

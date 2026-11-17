@@ -132,6 +132,61 @@ class StellaLinkTests(unittest.TestCase):
             (project_dir / "project.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["dataset_ref"], "first.jsonl")
 
+    def test_refuses_same_name_dataset_with_different_content(self):
+        # v0.1.4 T2: the name matches, but the file on disk is a
+        # different dataset — replacing it silently would lose
+        # the user's data.
+        project_dir = self.home / "profiles" / "demo" / "projects" / "first"
+        project_dir.mkdir(parents=True)
+        (project_dir / "project.json").write_text(
+            json.dumps(_project_manifest(dataset_ref="first.jsonl")),
+            encoding="utf-8")
+        other = '{"prompt": "old", "completion": "data"}\n'
+        (project_dir / "first.jsonl").write_text(other, encoding="utf-8")
+        result = stella_link.link_dataset(
+            self.jsonl, "demo", "first", home=self.home)
+        self.assertFalse(result["ok"])
+        self.assertIn("already holds a different dataset",
+                      result["message"])
+        self.assertEqual(
+            (project_dir / "first.jsonl").read_text(encoding="utf-8"),
+            other)
+        self.assertEqual(list(project_dir.glob("*.scout-bak")), [])
+
+    def test_same_content_same_name_links_again(self):
+        # v0.1.4 T2: re-linking the same dataset is not a
+        # replacement — the file already on disk is identical.
+        project_dir = self.home / "profiles" / "demo" / "projects" / "first"
+        project_dir.mkdir(parents=True)
+        (project_dir / "project.json").write_text(
+            json.dumps(_project_manifest(dataset_ref="first.jsonl")),
+            encoding="utf-8")
+        (project_dir / "first.jsonl").write_text(JSONL, encoding="utf-8")
+        result = stella_link.link_dataset(
+            self.jsonl, "demo", "first", home=self.home)
+        self.assertTrue(result["ok"], result["message"])
+        manifest = json.loads(
+            (project_dir / "project.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["dataset_ref"], "first.jsonl")
+
+    def test_replace_same_name_dataset_when_asked(self):
+        # v0.1.4 T2: with Replace checked, a same-name
+        # different dataset is replaced — and backed up.
+        project_dir = self.home / "profiles" / "demo" / "projects" / "first"
+        project_dir.mkdir(parents=True)
+        (project_dir / "project.json").write_text(
+            json.dumps(_project_manifest(dataset_ref="first.jsonl")),
+            encoding="utf-8")
+        other = '{"prompt": "old", "completion": "data"}\n'
+        (project_dir / "first.jsonl").write_text(other, encoding="utf-8")
+        result = stella_link.link_dataset(
+            self.jsonl, "demo", "first", home=self.home, replace=True)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertIsNotNone(result["backup"])
+        self.assertEqual(
+            (project_dir / "first.jsonl").read_text(encoding="utf-8"),
+            JSONL)
+
     def test_damaged_project_is_left_alone(self):
         project_dir = self.home / "profiles" / "demo" / "projects" / "first"
         project_dir.mkdir(parents=True)

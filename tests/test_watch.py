@@ -139,5 +139,70 @@ class WatchRunTests(unittest.TestCase):
         self.assertEqual(failures, [("GitHub", "GitHub is down")])
 
 
+class WatchNewFlagsTests(unittest.TestCase):
+    """v0.1.4 T42: "new" flags survive runs until the user sees them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._old = os.environ.get("SCOUT_HOME")
+        os.environ["SCOUT_HOME"] = self.tmp.name
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("SCOUT_HOME", None)
+        else:
+            os.environ["SCOUT_HOME"] = self._old
+
+    def test_quiet_run_keeps_earlier_new_items(self):
+        made = watch.new_watch("math")
+        watch.apply_watch_results(
+            made, [_result("https://example.com/a")], now=NOW)
+        watch.apply_watch_results(
+            made, [_result("https://example.com/a"),
+                   _result("https://example.com/b")],
+            now=NOW + timedelta(hours=25))
+        self.assertEqual([item["url"] for item in made["new"]],
+                         ["https://example.com/b"])
+        # A later run finds nothing new: the flag must survive.
+        found = watch.apply_watch_results(
+            made, [_result("https://example.com/a"),
+                   _result("https://example.com/b")],
+            now=NOW + timedelta(hours=50))
+        self.assertEqual(found, [])
+        self.assertEqual([item["url"] for item in made["new"]],
+                         ["https://example.com/b"])
+        self.assertFalse(made["new_seen"])
+
+    def test_fresh_items_join_unseen_ones_without_duplicates(self):
+        made = watch.new_watch("math")
+        watch.apply_watch_results(
+            made, [_result("https://example.com/a")], now=NOW)
+        watch.apply_watch_results(
+            made, [_result("https://example.com/a"),
+                   _result("https://example.com/b")],
+            now=NOW + timedelta(hours=25))
+        found = watch.apply_watch_results(
+            made, [_result("https://example.com/a"),
+                   _result("https://example.com/b"),
+                   _result("https://example.com/c")],
+            now=NOW + timedelta(hours=50))
+        self.assertEqual([item["url"] for item in found],
+                         ["https://example.com/c"])
+        self.assertEqual([item["url"] for item in made["new"]],
+                         ["https://example.com/b",
+                          "https://example.com/c"])
+
+    def test_new_seen_flag_round_trips_through_disk(self):
+        made = watch.new_watch("math")
+        made["new"] = [_result("https://example.com/b")]
+        made["new_seen"] = False
+        watch.save_watches([made])
+        loaded = watch.load_watches()
+        self.assertEqual(len(loaded), 1)
+        self.assertFalse(loaded[0]["new_seen"])
+        self.assertEqual(len(loaded[0]["new"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

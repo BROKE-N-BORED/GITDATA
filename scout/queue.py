@@ -8,12 +8,13 @@ An item left "running" when the app closed (a crash, or a close
 mid-run) comes back as "queued" on the next load, so it runs
 again instead of staying stuck as running forever.
 
-Pause is the queue simply not running: the worker stops after
-the item it is on, every finished item keeps its state, and
-starting again picks up where it left off. Each item downloads
-through the same download_and_convert path as a one-off
-download, so byte-level resume (T27) applies to queued items
-exactly as it applies to single downloads.
+Pause is the queue simply not running: pausing stops the
+download in progress at once and queues that item again, so
+starting again resumes it from the half-downloaded file; every
+finished item keeps its state. Each item downloads through the
+same download_and_convert path as a one-off download, so
+byte-level resume (T27) applies to queued items exactly as it
+applies to single downloads.
 """
 
 from __future__ import annotations
@@ -133,6 +134,26 @@ def clear_finished(entries: list[dict]) -> list[dict]:
     """Drop done and failed entries; waiting ones stay."""
     return [entry for entry in entries
             if entry["state"] in (QUEUED, RUNNING)]
+
+
+def retry_failed(entries: list[dict],
+                 entry_ids: list[str] | None = None) -> int:
+    """Queue failed entries again (T45): back to waiting, with
+    the old error, outputs, and row count cleared. With no ids,
+    every failed entry is retried. Returns how many were queued."""
+    wanted = None if entry_ids is None else set(entry_ids)
+    retried = 0
+    for entry in entries:
+        if entry.get("state") != FAILED:
+            continue
+        if wanted is not None and entry.get("id") not in wanted:
+            continue
+        entry["state"] = QUEUED
+        entry["outputs"] = []
+        entry["rows"] = 0
+        entry["error"] = ""
+        retried += 1
+    return retried
 
 
 def next_queued(entries: list[dict]) -> dict | None:

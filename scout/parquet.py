@@ -23,6 +23,9 @@ below with a 6.8 MB peak RSS rise over the import baseline.
 
 from __future__ import annotations
 
+import http.client
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 
@@ -33,7 +36,8 @@ BATCH_SIZE = 1000
 
 READER_MISSING_MESSAGE = (
     "Scout needs the Parquet reader (pyarrow) to convert this "
-    "file, and it is not installed."
+    "file, and it is not installed. Run the installer again to "
+    "add it."
 )
 
 
@@ -56,6 +60,112 @@ def reader_available() -> bool:
     except ImportError:
         return False
     return True
+
+
+class _RangedFile:
+    """A seekable read-only file over HTTP Range requests.
+
+    Parquet keeps its metadata (including the column names) in a
+    footer at the end of the file, so reading just the footer
+    answers "what columns does this file hold" without
+    downloading the data. Each read is one ranged GET.
+    """
+
+    def __init__(self, url: str, size: int, timeout: int = 20):
+        self._url = url
+        self._size = size
+        self._timeout = timeout
+        self._pos = 0
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        # pyarrow checks this before reading (NativeFile._assert_open).
+        return self._closed
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            target = offset
+        elif whence == 1:
+            target = self._pos + offset
+        elif whence == 2:
+            target = self._size + offset
+        else:
+            raise ValueError(f"Unknown whence: {whence}")
+        self._pos = max(0, min(self._size, target))
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._size - self._pos
+        if size <= 0 or self._pos >= self._size:
+            return b""
+        end = min(self._size - 1, self._pos + size - 1)
+        request = urllib.request.Request(
+            self._url, method="GET",
+            headers={"Range": f"bytes={self._pos}-{end}",
+                     "User-Agent": "DatasetScout"})
+        with urllib.request.urlopen(request,
+                                    timeout=self._timeout) as response:
+            data = response.read()
+        self._pos += len(data)
+        return data
+
+    def close(self) -> None:
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def _remote_size(url: str, timeout: int = 20) -> int | None:
+    """The size a URL declares, via HEAD, or None when unknown."""
+    request = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "DatasetScout"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            length = response.headers.get("Content-Length")
+            return int(length) if length else None
+    except (urllib.error.URLError, OSError, ValueError,
+            http.client.HTTPException):
+        return None
+
+
+def read_remote_columns(url: str, timeout: int = 20) -> list[str]:
+    """Column names of a Parquet file at a URL (v0.1.4 T10).
+
+    Only the file's footer is fetched, never its rows. Raises
+    ParquetError when the reader is missing, the size is unknown,
+    or the footer cannot be read.
+    """
+    try:
+        pq = _load_pyarrow()
+    except ImportError as exc:
+        raise ParquetError(READER_MISSING_MESSAGE) from exc
+    size = _remote_size(url, timeout)
+    if size is None or size <= 0:
+        raise ParquetError(
+            "could not read the file to check its shape")
+    try:
+        parquet_file = pq.ParquetFile(_RangedFile(url, size, timeout))
+        return list(parquet_file.schema_arrow.names)
+    except Exception as exc:  # noqa: BLE001 - pyarrow raises its own errors
+        raise ParquetError(
+            f"could not read the file as a Parquet file: {exc}"
+        ) from exc
 
 
 def _plain_value(value):

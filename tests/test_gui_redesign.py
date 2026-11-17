@@ -1,4 +1,5 @@
 """GUI tests for the v0.1.3 UI redesign (T44-T61) — offscreen, no live network."""
+import json
 import os
 import tempfile
 import time
@@ -18,11 +19,12 @@ from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtCore import Qt
 
-from scout import core
+from scout import apis, core
 from scout.gui import (
     DARK_STYLESHEET, HOW_TO_USE_SECTIONS, SHORTCUTS, AddLinkDialog,
-    CollapsibleSection, EditItemDialog, FlowLayout, MainWindow,
-    ShortcutsDialog, _explain, _heading, _looks_like_url,
+    CollapsibleSection, EditItemDialog, FlowLayout, L_LINK, L_NOTES,
+    L_STATE, L_STELLA, L_TITLE, MainWindow, R_DESC, R_SCORE, R_STELLA,
+    R_TITLE, ShortcutsDialog, _explain, _heading, _looks_like_url,
 )
 
 APP = None
@@ -505,6 +507,13 @@ class ChecklistTests(RedesignTestCase):
             "title": "a", "url": "https://example.com/a"})]
         core.save_list(self.window.my_list)
         self.window._refresh_list_tab()
+        # The completion beat (v0.1.4 T36): the ticked list shows
+        # for a moment before hiding, instead of vanishing with
+        # the save step still unticked.
+        self.assertFalse(self.window.checklist_box.isHidden())
+        self.assertTrue(
+            self.window.checklist_labels["save"].text().startswith("✓ "))
+        QTest.qWait(1700)
         self.assertTrue(self.window.checklist_box.isHidden())
 
     def test_dismiss_hides_it_for_good(self):
@@ -547,7 +556,10 @@ class CompletionTests(RedesignTestCase):
             [(0, items[0]), (1, items[1])])
         self.window._stella_check_done(stopped=False)
         self.assertEqual(self.window.finish_label.text(), "✓ Done")
-        self.assertIn("1 of 2 datasets STELLA-ready",
+        # v0.1.4 T17: the summary counts ready and convertible
+        # separately, instead of only counting ready.
+        self.assertIn("STELLA check done: 1 ready now, "
+                      "1 need conversion.",
                       self.window.statusBar().currentMessage())
 
     def test_starting_work_clears_the_finish(self):
@@ -666,6 +678,364 @@ class SourcesHeaderTests(RedesignTestCase):
     def test_remove_column_has_a_header(self):
         header = self.window.sources_table.horizontalHeaderItem(2)
         self.assertEqual(header.text(), "Remove")
+
+
+LONG_TITLE = ("A very long dataset title that keeps going and going to "
+              "test how the table copes with long text in a narrow window")
+LONG_DESC = ("A very long description that keeps going and going with "
+             "lots of detail about the dataset contents and its purpose.")
+
+
+def _result(**overrides):
+    item = {"title": "Math sets", "url": "https://example.com/math",
+            "category": "reasoning", "source": "Hugging Face", "stars": 5,
+            "downloads": 100, "updated": "2026-11-01T00:00:00Z",
+            "description": "A math dataset.", "license": "MIT",
+            "format": "JSONL", "stella_status": "convert",
+            "stella_files": ["train.jsonl"], "stella_size": 1234}
+    item.update(overrides)
+    return item
+
+
+class SearchTabFitTests(RedesignTestCase):
+    """v0.1.4 T31: the Search tab fits at the default 1100x700."""
+
+    def test_results_columns_and_buttons_fit_at_1100x700(self):
+        self.window.show()
+        self.window.resize(1100, 700)
+        QTest.qWait(100)
+        self.window._search_done([
+            _result(title=LONG_TITLE, description=LONG_DESC),
+            _result(title="Short", url="https://example.com/short"),
+        ])
+        QTest.qWait(100)
+        # The fit runs on search and on resize; re-fit once the
+        # layout has settled, as a resize would.
+        self.window._fit_results_columns()
+        QTest.qWait(100)
+        table = self.window.results_table
+        total = sum(table.columnWidth(col)
+                    for col in range(table.columnCount()))
+        self.assertLessEqual(total, table.viewport().width())
+        self.assertFalse(table.horizontalScrollBar().isVisible())
+        tab = self.window.tabs.widget(0)
+        scroll = tab.findChild(QScrollArea)
+        scroll.verticalScrollBar().setValue(0)
+        QTest.qWait(50)
+        load_more = self.window.load_more_button
+        self.assertLessEqual(load_more.y() + load_more.height(),
+                             scroll.viewport().height())
+        add = self.window.add_selected_button
+        self.assertLessEqual(add.y() + add.height(),
+                             scroll.viewport().height())
+
+    def test_fit_survives_the_first_run_checklist(self):
+        # The checklist is visible on a first search: the tab
+        # must still fit, not squeeze the detail pane to 2 lines.
+        self.window.show()
+        self.window.resize(1100, 700)
+        QTest.qWait(100)
+        self.window._search_done([_result()])
+        QTest.qWait(100)
+        self.assertTrue(self.window.checklist_box.isVisible())
+        tab = self.window.tabs.widget(0)
+        scroll = tab.findChild(QScrollArea)
+        scroll.verticalScrollBar().setValue(0)
+        QTest.qWait(50)
+        load_more = self.window.load_more_button
+        self.assertLessEqual(load_more.y() + load_more.height(),
+                             scroll.viewport().height())
+
+
+class MyListFitTests(RedesignTestCase):
+    """v0.1.4 T32: Title is capped, State and STELLA stay visible."""
+
+    def test_long_title_does_not_push_state_off_screen(self):
+        self.window.my_list = [core.normalize_item(_result(
+            title=LONG_TITLE, notes="A very long note that also keeps "
+            "going and going past any reasonable width for a cell"))]
+        core.save_list(self.window.my_list)
+        self.window.show()
+        self.window.resize(1366, 768)
+        # The tab must be current before measuring: a hidden tab
+        # has no real geometry yet.
+        self.window.tabs.setCurrentIndex(self.window.list_tab_index)
+        self.window._refresh_list_tab()
+        QTest.qWait(100)
+        table = self.window.list_table
+        self.assertLessEqual(table.columnWidth(L_TITLE), 320)
+        self.assertLessEqual(table.columnWidth(L_NOTES), 200)
+        stella_right = sum(table.columnWidth(col)
+                           for col in range(L_STELLA + 1))
+        self.assertLessEqual(stella_right, table.viewport().width())
+
+
+class StatusBarPriorityTests(RedesignTestCase):
+    """v0.1.4 T33: the message gets priority over the widgets."""
+
+    def test_narrow_window_hides_takeaway_and_health_bar(self):
+        self.window.show()
+        self.window.resize(1100, 700)
+        QTest.qWait(100)
+        self.assertTrue(self.window.health_takeaway.isHidden())
+        self.assertTrue(self.window.health_bar.isHidden())
+        self.window.resize(1366, 768)
+        QTest.qWait(100)
+        self.assertFalse(self.window.health_takeaway.isHidden())
+        self.assertFalse(self.window.health_bar.isHidden())
+
+    def test_rate_meter_is_short(self):
+        self.assertLessEqual(len("GitHub: quota unknown"), 25)
+        # GITHUB_RATE is module state: earlier tests leave a
+        # remaining count behind, so clear it first.
+        saved = dict(apis.GITHUB_RATE)
+        self.addCleanup(apis.GITHUB_RATE.update, saved)
+        apis.GITHUB_RATE.clear()
+        self.window._refresh_rate()
+        self.assertEqual(self.window.rate_label.text(),
+                         "GitHub: quota unknown")
+
+
+class EmptyListMessageTests(RedesignTestCase):
+    """v0.1.4 T34/T37: empty actions say so."""
+
+    def test_clear_all_on_empty_list_says_so(self):
+        self.assertEqual(self.window.my_list, [])
+        self.window.clear_list()
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "My List is empty. Nothing to clear.")
+
+    def test_add_all_with_no_results_says_so(self):
+        self.window.add_all_results()
+        self.assertIn("No results to add yet",
+                      self.window.statusBar().currentMessage())
+
+    def test_add_all_when_everything_is_already_saved_says_so(self):
+        self.window._search_done([_result()])
+        self.window.add_all_results()
+        self.assertIn("Added 1 to My List.",
+                      self.window.statusBar().currentMessage())
+        self.window.add_all_results()
+        self.assertIn("already in My List",
+                      self.window.statusBar().currentMessage())
+
+
+class DeclinedConfirmTests(RedesignTestCase):
+    """v0.1.4 T35: answering No says what was kept."""
+
+    def _decline(self, call):
+        with unittest.mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.No):
+            call()
+
+    def test_declining_a_remove_says_what_was_kept(self):
+        self.window.my_list = [core.normalize_item(_result())]
+        self.window._refresh_list_tab()
+        self.window.list_table.selectRow(0)
+        self._decline(self.window.remove_selected)
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Kept 1 link in My List.")
+        self.assertEqual(len(self.window.my_list), 1)
+
+    def test_declining_clear_says_what_was_kept(self):
+        self.window.my_list = [core.normalize_item(_result()),
+                               core.normalize_item(_result(
+                                   title="Two",
+                                   url="https://example.com/two"))]
+        self.window._refresh_list_tab()
+        self._decline(self.window.clear_list)
+        self.assertIn("Kept My List as it is (2 links)",
+                      self.window.statusBar().currentMessage())
+
+    def test_declining_a_website_remove_says_what_was_kept(self):
+        self._decline(lambda: self.window.remove_source(
+            core.load_sources()[0]["name"]))
+        first = core.load_sources()[0]["name"]
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         f"Kept {first}.")
+
+    def test_declining_a_restore_says_what_was_kept(self):
+        self._decline(self.window.restore_sources)
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Kept your websites as they are.")
+
+
+class SourcesLayoutTests(RedesignTestCase):
+    """v0.1.4 T39/T54: the Remove column fits its button, and the
+    empty-state guidance sits where the eye lands first."""
+
+    def test_remove_column_is_sized_to_its_button(self):
+        self.window.show()
+        self.window.resize(1366, 768)
+        QTest.qWait(100)
+        table = self.window.sources_table
+        self.assertLess(table.columnWidth(2), table.columnWidth(1))
+        self.assertLessEqual(table.columnWidth(2), 130)
+
+    def test_empty_guidance_sits_above_the_table(self):
+        tab = self.window.tabs.widget(2)
+        layout = tab.layout()
+        self.assertLess(layout.indexOf(self.window.sources_empty_label),
+                        layout.indexOf(self.window.sources_table))
+
+
+class DetailFilesTests(RedesignTestCase):
+    """v0.1.4 T41/T49: the file list is capped, the link clicks."""
+
+    def _seed_many_files(self):
+        self.window._search_done([_result(
+            stella_files=[f"data/file-{n:04d}.jsonl"
+                          for n in range(200)])])
+        self.window.results_table.selectRow(0)
+        QTest.qWait(50)
+
+    def test_many_files_cap_at_five_with_and_n_more(self):
+        self._seed_many_files()
+        text = self.window.detail_view.toPlainText()
+        self.assertIn("and 195 more files.", text)
+        longest = max(len(line) for line in text.splitlines())
+        self.assertLess(longest, 1000)
+        self.assertLess(len(text), 10000)
+
+    def test_detail_link_is_clickable(self):
+        self._seed_many_files()
+        self.assertTrue(self.window.detail_view.openExternalLinks())
+        html = self.window.detail_view.toHtml()
+        self.assertIn("<a href=\"https://example.com/math\">", html)
+        self.assertIn("Link: https://example.com/math",
+                      self.window.detail_view.toPlainText())
+
+
+class SectionMemoryTests(RedesignTestCase):
+    """v0.1.4 T47: collapsing a section survives a restart."""
+
+    def test_collapsed_section_stays_collapsed(self):
+        self.window.edit_section.set_expanded(False)
+        self.assertEqual(
+            core.load_config().get("sections", {}).get("list-edit"),
+            False)
+        second = MainWindow()
+        self.addCleanup(second.close)
+        self.assertFalse(second.edit_section.is_expanded())
+        self.assertTrue(second.remove_section.is_expanded())
+
+    def test_sections_ship_expanded(self):
+        self.assertTrue(self.window.remove_section.is_expanded())
+        self.assertTrue(self.window.edit_section.is_expanded())
+        self.assertTrue(self.window.export_section.is_expanded())
+
+
+class StellaCheckAllTests(RedesignTestCase):
+    """v0.1.4 T51: with nothing selected, the check covers all."""
+
+    def _seed_results(self, count=4):
+        self.window._search_done([
+            _result(title=f"Item {n}",
+                    url=f"https://example.com/{n}")
+            for n in range(count)])
+
+    def test_unselected_results_check_checks_everything(self):
+        self._seed_results(4)
+
+        def fast_sniff(item, token=""):
+            return {"status": "ready", "files": ["train.jsonl"],
+                    "total_size": 10, "detail": "ok"}
+
+        with unittest.mock.patch.object(
+                apis, "sniff_item", side_effect=fast_sniff):
+            self.window.start_stella_check("results")
+            self.assertEqual(self.window._stella_total, 4)
+            deadline = 100
+            while (not self.window.stella_check_button.isEnabled()
+                   and deadline > 0):
+                QTest.qWait(50)
+                deadline -= 1
+            self.assertTrue(self.window.stella_check_button.isEnabled())
+
+    def test_unselected_list_check_checks_everything(self):
+        self.window.my_list = [core.normalize_item(_result(
+            title=f"Item {n}", url=f"https://example.com/{n}"))
+            for n in range(3)]
+        core.save_list(self.window.my_list)
+        self.window._refresh_list_tab()
+
+        def fast_sniff(item, token=""):
+            return {"status": "ready", "files": ["train.jsonl"],
+                    "total_size": 10, "detail": "ok"}
+
+        with unittest.mock.patch.object(
+                apis, "sniff_item", side_effect=fast_sniff):
+            self.window.start_stella_check("list")
+            self.assertEqual(self.window._stella_total, 3)
+            deadline = 100
+            while (not self.window.list_stella_button.isEnabled()
+                   and deadline > 0):
+                QTest.qWait(50)
+                deadline -= 1
+            self.assertTrue(self.window.list_stella_button.isEnabled())
+
+    def test_empty_list_has_nothing_to_check(self):
+        self.window.start_stella_check("list")
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Nothing to check yet.")
+
+
+class ShortcutsTeachTests(RedesignTestCase):
+    """v0.1.4 T52: the ? overlay teaches Enter, Ctrl+A, double-click."""
+
+    def test_overlay_lists_the_missing_keys(self):
+        dialog = ShortcutsDialog(self.window)
+        self.addCleanup(dialog.close)
+        text = dialog.text.toPlainText()
+        self.assertIn("Enter", text)
+        self.assertIn("Ctrl+A", text)
+        self.assertIn("Double-click", text)
+        self.assertIn("selects every row in the table", text)
+        self.assertIn("opens the picked row in your browser", text)
+
+    def test_ctrl_a_selects_every_row(self):
+        self.window._search_done([_result(),
+                                  _result(title="Two",
+                                          url="https://example.com/two")])
+        table = self.window.results_table
+        table.setFocus()
+        table.selectRow(0)
+        QTest.keyClick(table, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        QTest.qWait(50)
+        self.assertEqual(len(self.window._selected_results()), 2)
+
+
+class RecoveryRecordTests(RedesignTestCase):
+    """v0.1.4 T53: a .bak recovery leaves a persistent record."""
+
+    def test_recovery_is_recorded_and_shown_in_about(self):
+        path = core.list_path()
+        bak = path.with_name(path.name + ".bak")
+        bak.write_text(json.dumps({"active": "My List",
+                                   "collections": [{"name": "My List",
+                                                    "items": [
+                                                        core.normalize_item(
+                                                            _result()),
+                                                        core.normalize_item(
+                                                            _result(
+                                                                title="Two",
+                                                                url="https://example.com/two")),
+                                                    ]}]}),
+                       encoding="utf-8")
+        path.write_text("{damaged", encoding="utf-8")
+        core.list_load_notice()  # drain any earlier notes
+        items = core.load_list()
+        self.assertEqual(len(items), 2)
+        record = core.load_config().get("list_recovered")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["links"], 2)
+        about = self.window._about_text()
+        self.assertIn("backup copy", about)
+        self.assertIn("2 links recovered", about)
+
+    def test_about_has_no_recovery_line_without_a_recovery(self):
+        self.assertNotIn("backup copy", self.window._about_text())
 
 
 if __name__ == "__main__":

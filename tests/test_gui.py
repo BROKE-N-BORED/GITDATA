@@ -7,6 +7,7 @@ import time
 import unittest
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,9 +22,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtTest import QTest
 from PySide6.QtCore import QModelIndex, QSettings, Qt
 
-from scout import apis, core
+from scout import apis, core, watch
 from scout.gui import (
-    HOW_TO_USE_SECTIONS, R_STARS, SETTINGS_APP, SETTINGS_ORG,
+    HOW_TO_USE_SECTIONS, R_SCORE, R_STARS, SETTINGS_APP, SETTINGS_ORG,
     SHORTCUTS, EditItemDialog, MainWindow, SingleInstance,
 )
 
@@ -170,6 +171,7 @@ class SearchFlowTests(GuiTestCase):
                 apis, "search_github", return_value=fake_gh), \
              unittest.mock.patch.object(
                 apis, "search_huggingface", return_value=fake_hf):
+            self.window.search_box.setCurrentText("reasoning")
             self.window.start_search()
             self.assertFalse(self.window.search_button.isEnabled())
             deadline = 100  # 100 x 50 ms = 5 s max
@@ -198,6 +200,32 @@ class FoundLinkTests(GuiTestCase):
     def test_add_found_link_needs_a_url(self):
         self.window.add_found_link()
         self.assertEqual(len(self.window.my_list), 0)
+
+    def test_add_found_link_to_huggingface_gets_that_source(self):
+        # v0.1.4 T3: the source comes from the URL, so the sniff
+        # and download dispatch on it.
+        self.window.found_url.setText(
+            "https://huggingface.co/datasets/acme/tiny")
+        self.window.found_title.setText("Tiny")
+        self.window.add_found_link()
+        self.assertEqual(self.window.my_list[0]["source"],
+                         "Hugging Face")
+
+    def test_add_found_link_to_github_gets_that_source(self):
+        self.window.found_url.setText("https://github.com/acme/tiny")
+        self.window.found_title.setText("Tiny")
+        self.window.add_found_link()
+        self.assertEqual(self.window.my_list[0]["source"], "GitHub")
+
+    def test_add_found_link_blocks_a_bad_link(self):
+        # v0.1.4 T22: a link that fails the inline check is
+        # refused, not added.
+        self.window.found_url.setText("not a link")
+        self.window.found_title.setText("Tiny")
+        self.window.add_found_link()
+        self.assertEqual(len(self.window.my_list), 0)
+        self.assertIn("does not look like a link",
+                      self.window.statusBar().currentMessage())
 
 
 class SourcesTabTests(GuiTestCase):
@@ -261,6 +289,34 @@ class SourcesTabTests(GuiTestCase):
         self.assertEqual(core.get_github_token(), "ghp_GUI_TOKEN_999")
         report = core.debug_report()
         self.assertNotIn("ghp_GUI_TOKEN_999", report)
+
+    def test_add_source_clears_errors_after_success(self):
+        # v0.1.4 T8: a failed add leaves red errors; a good add
+        # clears them instead of re-validating the emptied form.
+        self.window.site_name.setText("")
+        self.window.site_url.setText("not a link")
+        self.window.add_source()
+        self.assertTrue(self.window.site_name_error.text()
+                        or self.window.site_url_error.text())
+        self.window.site_name.setText("Example Site")
+        self.window.site_url.setText("https://example.com/?q={q}")
+        self.window.add_source()
+        self.assertEqual(self.window.site_name_error.text(), "")
+        self.assertEqual(self.window.site_url_error.text(), "")
+        self.assertTrue(self.window.site_name_error.isHidden())
+        self.assertTrue(self.window.site_url_error.isHidden())
+
+    def test_save_token_names_a_junk_token(self):
+        # v0.1.4 T21: a token that fails the check still saves,
+        # but the status says so in one line instead of
+        # claiming plain success beside a red error.
+        self.window.token_field.setText("x")
+        self.window.save_token()
+        self.assertEqual(core.get_github_token(), "x")
+        self.assertEqual(
+            self.window.statusBar().currentMessage(),
+            "Saved, but that token looks too short. "
+            "Paste the whole token.")
 
 
 class ListTabTests(GuiTestCase):
@@ -486,6 +542,7 @@ class BusyDotTests(GuiTestCase):
                 apis, "search_github", side_effect=slow_github), \
              unittest.mock.patch.object(
                 apis, "search_huggingface", return_value=[]):
+            self.window.search_box.setCurrentText("reasoning")
             self.window.start_search()
             self.assertFalse(self.window.busy_dot.isHidden())
             release.set()
@@ -610,6 +667,33 @@ class LinkCheckStopTests(GuiTestCase):
         self.assertEqual(statuses.count(""), 8 - checked)
         self.assertNotIn("checking", statuses)
 
+    def test_stop_drops_in_flight_checks_at_once(self):
+        # v0.1.4 T27: Stop drops the checks in flight instead of
+        # waiting for them, so the run ends at once — and the
+        # count only covers checks that finished.
+        def slow_check(url):
+            time.sleep(2)
+            return "ok"
+
+        with unittest.mock.patch.object(
+                apis, "check_link", side_effect=slow_check):
+            started = time.monotonic()
+            self.window.start_link_check()
+            QTest.qWait(300)
+            self.window.stop_link_check()
+            self._wait_for_check_button()
+            elapsed = time.monotonic() - started
+        # The checks take 2 s each; a stop that waited for them
+        # would take at least 2 s.
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(self.window._check_done_count, 0)
+        self.assertEqual(
+            self.window.statusBar().currentMessage(),
+            "Stopped, 0 of 8 checked.")
+        self.assertNotIn(
+            "checking",
+            [item["status"] for item in self.window.my_list])
+
 
 class PartialSearchTests(GuiTestCase):
     """U32: one source failing never hides the other, and the user
@@ -638,6 +722,7 @@ class PartialSearchTests(GuiTestCase):
                 side_effect=apis.SearchError("GitHub is down")), \
              unittest.mock.patch.object(
                 apis, "search_huggingface", return_value=self.FAKE_HF):
+            self.window.search_box.setCurrentText("reasoning")
             self.window.start_search()
             self._wait_for_search_button()
         self.assertEqual(self.window.results_table.rowCount(), 1)
@@ -652,6 +737,7 @@ class PartialSearchTests(GuiTestCase):
              unittest.mock.patch.object(
                 apis, "search_huggingface",
                 side_effect=apis.SearchError("Hugging Face is down")):
+            self.window.search_box.setCurrentText("reasoning")
             self.window.start_search()
             self._wait_for_search_button()
         self.assertEqual(self.window.results_table.rowCount(), 1)
@@ -669,6 +755,7 @@ class PartialSearchTests(GuiTestCase):
                 side_effect=apis.SearchError("Hugging Face is down")), \
              unittest.mock.patch.object(
                 QMessageBox, "warning") as warning:
+            self.window.search_box.setCurrentText("reasoning")
             self.window.start_search()
             self._wait_for_search_button()
             deadline = 100
@@ -680,6 +767,124 @@ class PartialSearchTests(GuiTestCase):
         self.assertIn("GitHub", message)
         self.assertIn("Hugging Face", message)
         self.assertEqual(self.window.results_table.rowCount(), 0)
+
+    def test_both_fail_with_the_same_reason_says_it_once(self):
+        # v0.1.4 T23: both sources failed for the same cause
+        # (the internet is down), so the message is one plain
+        # sentence instead of the same sentence twice, once
+        # per source.
+        reason = ("Could not reach the internet. Check the "
+                  "connection and try again.")
+        with unittest.mock.patch.object(
+                apis, "search_github",
+                side_effect=apis.SearchError(reason)), \
+             unittest.mock.patch.object(
+                apis, "search_huggingface",
+                side_effect=apis.SearchError(reason)), \
+             unittest.mock.patch.object(
+                QMessageBox, "warning") as warning:
+            self.window.search_box.setCurrentText("reasoning")
+            self.window.start_search()
+            self._wait_for_search_button()
+            deadline = 100
+            while not warning.called and deadline > 0:
+                QTest.qWait(50)
+                deadline -= 1
+        self.assertTrue(warning.called)
+        message = warning.call_args[0][2]
+        self.assertEqual(message, reason)
+        self.assertNotIn("GitHub", message)
+        self.assertNotIn(";", message)
+
+    def test_token_rejection_is_named_on_screen(self):
+        # v0.1.4 T6: GitHub rejected the token, so the reason is
+        # shown in full instead of "did not answer".
+        reason = ("GitHub did not accept that token. Check the "
+                  "token in Settings, or clear it to search "
+                  "without one.")
+        self.window._search_done(list(self.FAKE_HF),
+                                 [("GitHub", reason)])
+        self.assertIn(reason,
+                      self.window.statusBar().currentMessage())
+        self.assertNotIn("did not answer",
+                         self.window.statusBar().currentMessage())
+
+    def test_failed_search_labels_the_empty_results(self):
+        # v0.1.4 T29: after a failed search the empty results
+        # label says the search failed, not the never-searched
+        # text.
+        with unittest.mock.patch.object(QMessageBox, "warning"):
+            self.window._search_failed("Search failed. GitHub: down")
+        self.assertIn("That search failed",
+                      self.window.results_empty_label.text())
+
+
+class EmptySearchTests(GuiTestCase):
+    """v0.1.4 T5: an empty search box refuses instead of
+    searching for the generic word "dataset"."""
+
+    def test_empty_search_is_refused(self):
+        with unittest.mock.patch.object(
+                apis, "search_github") as fake_gh, \
+             unittest.mock.patch.object(
+                apis, "search_huggingface") as fake_hf:
+            self.window.start_search()
+        fake_gh.assert_not_called()
+        fake_hf.assert_not_called()
+        self.assertIsNone(self.window.search_worker)
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Type a few words first.")
+
+    def test_empty_watch_is_refused(self):
+        self.window.watch_current_search()
+        self.assertEqual(watch.load_watches(), [])
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Type a few words first.")
+
+
+class StellaCheckGuiTests(GuiTestCase):
+    """v0.1.4 T13/T17: the score follows the STELLA badge, and
+    the check summary counts what it found."""
+
+    def test_score_cell_refreshes_with_the_badge(self):
+        item = {"title": "Fresh Data",
+                "url": "https://example.com/a",
+                "source": "Hugging Face", "stars": 500,
+                "downloads": 1000, "updated": "2026-11-14T00:00:00Z",
+                "description": "", "license": "MIT", "format": "",
+                "stella_status": ""}
+        self.window.results = [item]
+        self.window._show_results()
+        before = self.window.results_table.item(0, R_SCORE)
+        self.assertIn("not checked yet", before.toolTip())
+        item["stella_status"] = "ready"
+        self.window._update_result_stella_cell(0)
+        after = self.window.results_table.item(0, R_SCORE)
+        self.assertNotIn("not checked yet", after.toolTip())
+        self.assertIn("Already in STELLA shape", after.toolTip())
+
+    def test_check_summary_counts_what_it_found(self):
+        def _item(status):
+            return {"title": status,
+                    "url": f"https://example.com/{status}",
+                    "stella_status": status}
+        self.window._stella_target = "results"
+        self.window.stella_worker = SimpleNamespace(items=[
+            (0, _item("ready")),
+            (1, _item("convert")),
+            (2, _item("unknown")),
+            (3, _item("no-fields")),
+            (4, _item("needs-reader")),
+        ])
+        self.window._stella_check_done(False)
+        self.assertEqual(
+            self.window.statusBar().currentMessage(),
+            "✓ STELLA check done: 1 ready now, 1 need conversion, "
+            "1 could not be checked, 1 have no usable files, "
+            "1 need the Parquet reader.")
+        # The close handler stops every worker it finds; a fake
+        # one must not survive the test.
+        self.window.stella_worker = None
 
 
 class MenusTests(GuiTestCase):
@@ -933,6 +1138,37 @@ class EditDialogTests(GuiTestCase):
         self.assertEqual(item["category"], "training")
         self.assertEqual(item["notes"], "edited")
         self.assertEqual(item["state"], "downloaded")
+
+    def test_blank_title_blocks_the_save(self):
+        # v0.1.4 T26: a blank title stays in the dialog with a
+        # message beside the field, instead of saving while
+        # silently keeping the old title.
+        item = core.normalize_item(
+            {"title": "A", "url": "https://example.com/a",
+             "category": "reasoning"})
+        dialog = EditItemDialog(item, self.window)
+        dialog.title_field.setText("   ")
+        dialog.accept()
+        self.assertEqual(dialog.result(),
+                         QDialog.DialogCode.Rejected)
+        self.assertEqual(dialog.title_error.text(),
+                         "Give the link a title.")
+        dialog.close()
+
+    def test_bad_link_blocks_the_save(self):
+        # v0.1.4 T22: a link that fails the inline check blocks
+        # the edit, as on the add form.
+        item = core.normalize_item(
+            {"title": "A", "url": "https://example.com/a",
+             "category": "reasoning"})
+        dialog = EditItemDialog(item, self.window)
+        dialog.url_field.setText("not a link")
+        dialog.accept()
+        self.assertEqual(dialog.result(),
+                         QDialog.DialogCode.Rejected)
+        self.assertIn("does not look like a link",
+                      dialog.url_error.text())
+        dialog.close()
 
 
 class SearchCacheGuiTests(GuiTestCase):

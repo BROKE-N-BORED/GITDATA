@@ -33,6 +33,25 @@ from scout.gui import (  # noqa: E402
     LinkCheckWorker, MainWindow, UpdateCheckWorker,
 )
 
+# The download path asks for each file's declared size before
+# downloading it (v0.1.4 T25). The network is mocked at the apis
+# boundary in this module, so the size lookup answers "unknown"
+# by default; tests that need a declared size patch it
+# themselves.
+_CONTENT_LENGTH_PATCHER = None
+
+
+def setUpModule():
+    global _CONTENT_LENGTH_PATCHER
+    _CONTENT_LENGTH_PATCHER = mock.patch.object(
+        apis, "content_length", return_value=None)
+    _CONTENT_LENGTH_PATCHER.start()
+
+
+def tearDownModule():
+    if _CONTENT_LENGTH_PATCHER is not None:
+        _CONTENT_LENGTH_PATCHER.stop()
+
 
 class FakeResponse:
     """A canned urllib response (same shape as tests/test_apis.py)."""
@@ -1292,6 +1311,7 @@ class SearchWorkerDeadSourceTests(GuiTestCase):
                 side_effect=RuntimeError("boom")), \
              mock.patch.object(
                 apis, "search_huggingface", return_value=fake_hf):
+            self.window.search_box.setCurrentText("reasoning")
             self.window.start_search()
             self._wait_for_search_button()
         self.assertEqual(self.window.results_table.rowCount(), 1)
@@ -1397,7 +1417,7 @@ class RateMeterGuiTests(GuiTestCase):
     def test_unknown_when_no_search_data(self):
         self.window._refresh_rate()
         self.assertEqual(self.window.rate_label.text(),
-                         "GitHub: searches left unknown")
+                         "GitHub: quota unknown")
 
     def test_shows_searches_left_and_reset(self):
         reset = datetime(2026, 11, 15, 15, 30, tzinfo=timezone.utc)
@@ -1406,13 +1426,13 @@ class RateMeterGuiTests(GuiTestCase):
         self.window._refresh_rate()
         when = reset.astimezone().strftime("%H:%M")
         self.assertEqual(self.window.rate_label.text(),
-                         f"GitHub: 7 searches left, resets {when}")
+                         f"GitHub: 7 left, resets {when}")
 
-    def test_one_search_left_is_singular(self):
+    def test_one_left_shows_short_count(self):
         apis.GITHUB_RATE["search_remaining"] = 1
         self.window._refresh_rate()
         self.assertEqual(self.window.rate_label.text(),
-                         "GitHub: 1 search left")
+                         "GitHub: 1 left")
 
     def test_core_quota_never_shows_as_searches(self):
         apis.GITHUB_RATE["core_remaining"] = 42
@@ -1420,13 +1440,13 @@ class RateMeterGuiTests(GuiTestCase):
             2026, 11, 15, 15, 30, tzinfo=timezone.utc)
         self.window._refresh_rate()
         self.assertEqual(self.window.rate_label.text(),
-                         "GitHub: searches left unknown")
+                         "GitHub: quota unknown")
 
     def test_update_check_refreshes_the_meter(self):
         apis.GITHUB_RATE["search_remaining"] = 5
         self.window._update_check_done("v0.1.2")
         self.assertEqual(self.window.rate_label.text(),
-                         "GitHub: 5 searches left")
+                         "GitHub: 5 left")
 
 
 class CloseMidCheckTests(GuiTestCase):

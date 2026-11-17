@@ -42,7 +42,8 @@ CONVERTIBLE = {
 # Extensions Scout recognises as data files but cannot convert.
 UNSUPPORTED_NOTE = {
     ".parquet": "Parquet needs the Parquet reader (pyarrow), "
-                "which is not installed.",
+                "which is not installed. Run the installer again "
+                "to add it.",
     ".arrow": "Arrow needs conversion elsewhere: Scout cannot "
               "read Arrow files.",
     ".txt": "Plain text files have no rows to convert.",
@@ -97,6 +98,7 @@ def map_row(obj: dict) -> tuple[dict | None, str]:
     output = _nonempty(obj.get("output"))
     answer = _nonempty(obj.get("answer"))
     response = _nonempty(obj.get("response"))
+    ground_truth = _nonempty(obj.get("ground_truth"))
     if instruction and output:
         extra = _nonempty(obj.get("input"))
         prompt = instruction if not extra else f"{instruction}\n\n{extra}"
@@ -112,18 +114,44 @@ def map_row(obj: dict) -> tuple[dict | None, str]:
         extra = _nonempty(obj.get("input"))
         prompt = instruction if not extra else f"{instruction}\n\n{extra}"
         return {"prompt": prompt, "completion": response}, ""
+    if instruction and ground_truth:
+        extra = _nonempty(obj.get("input"))
+        prompt = instruction if not extra else f"{instruction}\n\n{extra}"
+        return {"prompt": prompt, "completion": ground_truth}, ""
     question = _nonempty(obj.get("question"))
     if question and answer:
         return {"prompt": question, "completion": answer}, ""
     if question and response:
         return {"prompt": question, "completion": response}, ""
+    if question and ground_truth:
+        return {"prompt": question, "completion": ground_truth}, ""
+    prompt = _nonempty(obj.get("prompt"))
+    if prompt and response:
+        return {"prompt": prompt, "completion": response}, ""
+    if prompt and ground_truth:
+        return {"prompt": prompt, "completion": ground_truth}, ""
     source = _nonempty(obj.get("input"))
     if source and output:
         return {"prompt": source, "completion": output}, ""
     # A broken prompt/messages field vetoes the row only when no
     # other mapping worked (v0.1.3 T30): a row with an empty prompt
-    # but a good instruction/output pair still converts.
+    # but a good instruction/output pair still converts. The
+    # reason names which half is missing (v0.1.4 T19): a prompt
+    # with no completion is not "prompt or completion is empty".
     if "prompt" in obj or "completion" in obj:
+        completion = _nonempty(obj.get("completion"))
+        if prompt and not completion:
+            if "completion" in obj:
+                return None, "completion is empty"
+            return None, "prompt has no completion to pair it with"
+        if completion and not prompt:
+            if "prompt" in obj:
+                return None, "prompt is empty"
+            return None, "completion has no prompt to pair it with"
+        if "prompt" in obj and "completion" not in obj:
+            return None, "prompt is empty"
+        if "completion" in obj and "prompt" not in obj:
+            return None, "completion is empty"
         return None, "prompt or completion is empty"
     if "messages" in obj:
         return None, "messages are not a valid conversation"
@@ -199,7 +227,8 @@ def convert_json_text(text: str) -> tuple[list[dict], dict]:
 # a header row; anything else is data (v0.1.3 T33).
 _CSV_KNOWN_FIELDS = frozenset({
     "prompt", "completion", "messages", "instruction", "input",
-    "output", "answer", "response", "question", "text",
+    "output", "answer", "response", "question", "ground_truth",
+    "text",
 })
 
 
@@ -270,13 +299,36 @@ def rows_to_jsonl(rows: list[dict]) -> str:
         json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
 
 
+def columns_map(columns) -> bool:
+    """True when a file with these column names could map to
+    STELLA rows (v0.1.4 T10).
+
+    A probe row with a value in every column is run through
+    map_row, so the Parquet sniff judges the same mappings the
+    converter uses. The messages column gets a valid conversation
+    as its probe value, since a plain string never maps.
+    """
+    probe: dict = {}
+    for name in columns or []:
+        if name == "messages":
+            probe[name] = [{"role": "user", "content": "x"},
+                           {"role": "assistant", "content": "y"}]
+        else:
+            probe[name] = "x"
+    row, _reason = map_row(probe)
+    return row is not None
+
+
 def peek_shape(text: str) -> tuple[str, str]:
     """Judge a file's first lines for the STELLA-ready check (T29).
 
-    Returns ("ready"|"convert"|"unknown", detail). "ready" means
-    the first rows are already in STELLA's shape; "convert" means
-    they map to it with conversion; "unknown" means the peek could
-    not tell (empty, not JSON, or no recognised fields).
+    Returns ("ready"|"convert"|"unmappable"|"unknown", detail).
+    "ready" means the first rows are already in STELLA's shape;
+    "convert" means they map to it with conversion; "unmappable"
+    means the file was read and its rows have no fields Scout can
+    map (v0.1.4 T12: checked, not failed); "unknown" means the
+    peek could not tell (empty, not JSON, or no recognised
+    fields).
     """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
@@ -305,7 +357,7 @@ def peek_shape(text: str) -> tuple[str, str]:
             f"{ready} of the first rows are already in STELLA's shape")
     if mappable:
         return "convert", "rows map to STELLA's shape with conversion"
-    return "unknown", "rows have no fields Scout can map"
+    return "unmappable", "rows have no fields Scout can map"
 
 
 def describe_report(report: dict) -> str:

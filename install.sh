@@ -50,10 +50,13 @@ echo "Setting up Dataset Scout's Python tools..."
 
 # T34: retry the big download up to 3 times, showing progress.
 # pip does not resume a partial download, so each retry starts
-# the download again from the beginning.
-echo "Downloading the interface toolkit (one-time, about 100 MB)..."
+# the download again from the beginning. pyarrow (the Parquet
+# reader, v0.1.4 T4) is bundled so Parquet datasets convert on a
+# real install; it is about 55 MB of the download and about
+# 169 MB on disk once installed.
+echo "Downloading the interface toolkit and the Parquet reader (one-time, about 200 MB)..."
 tries=0
-until "$DIR/.venv/bin/python" -m pip install PySide6-Essentials PySide6-Addons; do
+until "$DIR/.venv/bin/python" -m pip install PySide6-Essentials PySide6-Addons pyarrow; do
   tries=$((tries + 1))
   if [ "$tries" -ge 3 ]; then
     echo "ERROR: the download failed 3 times. Check the network and" >&2
@@ -66,9 +69,13 @@ done
 echo "Toolkit downloaded."
 
 # Fatal check: the GUI toolkit must import, or the install has failed.
-if ! "$DIR/.venv/bin/python" -c "import PySide6; from PySide6 import QtWidgets" 2>/dev/null; then
+# The real error is printed (v0.1.4 T9): discarding stderr and
+# guessing "network connection, or disk space" sent the user to
+# re-run a 6-minute install that would fail identically on a
+# missing system library.
+if ! import_error="$("$DIR/.venv/bin/python" -c "import PySide6; from PySide6 import QtWidgets" 2>&1)"; then
   echo "ERROR: PySide6 installed but cannot be imported." >&2
-  echo "Try again with a network connection, or check disk space." >&2
+  echo "$import_error" >&2
   exit 1
 fi
 
@@ -102,11 +109,18 @@ EOF
 
 # Desktop copy for double-click launch from the desktop too.
 # Cinnamon/Nemo refuse to launch an untrusted .desktop file, so the
-# copy is made executable AND marked trusted.
-cp "$HOME/.local/share/applications/dataset-scout.desktop" "$HOME/Desktop/Dataset Scout.desktop" 2>/dev/null || true
-chmod +x "$HOME/Desktop/Dataset Scout.desktop" 2>/dev/null || true
-if command -v gio >/dev/null 2>&1; then
-  gio set "$HOME/Desktop/Dataset Scout.desktop" metadata::trusted true 2>/dev/null || true
+# copy is made executable AND marked trusted. When there is no
+# ~/Desktop the copy is skipped, and the final message says so
+# (T40): never promise an icon that was not placed.
+DESKTOP_PLACED=0
+if [ -d "$HOME/Desktop" ]; then
+  if cp "$HOME/.local/share/applications/dataset-scout.desktop" "$HOME/Desktop/Dataset Scout.desktop" 2>/dev/null; then
+    DESKTOP_PLACED=1
+    chmod +x "$HOME/Desktop/Dataset Scout.desktop" 2>/dev/null || true
+    if command -v gio >/dev/null 2>&1; then
+      gio set "$HOME/Desktop/Dataset Scout.desktop" metadata::trusted true 2>/dev/null || true
+    fi
+  fi
 fi
 
 # Command line: `scout` on PATH after install.
@@ -118,11 +132,17 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 # Final check: Dataset Scout itself must import.
-if ! "$DIR/.venv/bin/python" -c "import scout; print(scout.__version__)" 2>/dev/null; then
+if ! scout_error="$("$DIR/.venv/bin/python" -c "import scout; print(scout.__version__)" 2>&1)"; then
   echo "ERROR: Dataset Scout did not import after install." >&2
+  echo "$scout_error" >&2
   exit 1
 fi
 
-echo "Dataset Scout is installed. Open it from the app menu (Dataset Scout) or"
-echo "double-click Dataset Scout on the desktop. No terminal needed."
+if [ "$DESKTOP_PLACED" -eq 1 ]; then
+  echo "Dataset Scout is installed. Open it from the app menu (Dataset Scout) or"
+  echo "double-click Dataset Scout on the desktop. No terminal needed."
+else
+  echo "Dataset Scout is installed. Open it from the app menu (Dataset Scout)."
+  echo "No terminal needed."
+fi
 echo "Command line is available too: scout search \"reasoning dataset\""

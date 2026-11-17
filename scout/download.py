@@ -79,6 +79,29 @@ def output_name(display: str) -> str:
     return safe_name(base) + ".jsonl"
 
 
+def _unconvertible_description(files: list[str]) -> str:
+    """What a file listing holds, in plain words (v0.1.4 T30).
+
+    "only .png and .jpg files" — so an image-only dataset is
+    named, not just denied. "" when there is nothing to name.
+    """
+    kinds = sorted({Path(name).suffix.lower() for name in files
+                    if Path(name).suffix})
+    if not kinds:
+        return ""
+    if len(kinds) == 1:
+        return f"only {kinds[0]} files"
+    if len(kinds) > 4:
+        return f"mostly {', '.join(kinds[:4])} files"
+    return "only " + ", ".join(kinds[:-1]) + f" and {kinds[-1]} files"
+
+
+def _over_cap_message() -> str:
+    """The plain refusal for a file over the 200 MB cap."""
+    return ("Download stopped: the file is bigger than "
+            f"{core.format_size(MAX_DATA_FILE_BYTES)}.")
+
+
 def _safe_relative(name: str) -> Path:
     """A file path from a dataset listing, kept inside its folder."""
     parts = [part for part in Path(name).parts
@@ -102,20 +125,24 @@ def _read_text(path: Path) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-def _convert_file(path: Path, out_path: Path) -> tuple[bool, str, int]:
+def _convert_file(path: Path, out_path: Path,
+                  display: str | None = None) -> tuple[bool, str, int]:
     """Convert one downloaded file. Returns (ok, message, rows).
 
     A bad file is a per-file failure, never an exception out (T9):
     a giant CSV field, a disk-full write, or a permission error is
     reported and the rest of the dataset still converts. A failed
-    write leaves no partial output behind.
+    write leaves no partial output behind. `display` is the name
+    shown in messages: the folder-qualified path, so two files
+    that share a basename are told apart (v0.1.4 T30).
     """
+    shown = display or path.name
     ext = _extension(path.name)
     kind = convert.CONVERTIBLE.get(ext)
     if kind is None:
         note = convert.UNSUPPORTED_NOTE.get(
             ext, "Scout cannot convert this kind of file.")
-        return False, f"skipped {path.name}: {note}", 0
+        return False, f"skipped {shown}: {note}", 0
     if kind == "parquet":
         # Parquet is read from the file, not from text, and needs
         # the optional reader (T62): a missing reader is a plain
@@ -123,19 +150,19 @@ def _convert_file(path: Path, out_path: Path) -> tuple[bool, str, int]:
         try:
             rows, report = parquet.convert_parquet_file(path)
         except parquet.ParquetError as exc:
-            return False, f"skipped {path.name}: {exc}", 0
+            return False, f"skipped {shown}: {exc}", 0
     else:
         try:
             text = _read_text(path)
             rows, report = convert.convert_text(text, kind)
         except OSError as exc:
-            return False, f"could not read {path.name}: {exc}", 0
+            return False, f"could not read {shown}: {exc}", 0
         except Exception as exc:  # noqa: BLE001 - one bad file must not kill the run
-            return False, f"could not convert {path.name}: {exc}", 0
+            return False, f"could not convert {shown}: {exc}", 0
     ok, problem = convert.validate_rows(rows)
     if not ok:
         return False, (
-            f"skipped {path.name}: {problem}. "
+            f"skipped {shown}: {problem}. "
             f"{convert.describe_report(report)}"), 0
     try:
         # Atomic (v0.1.3 T21): a failed write leaves no partial
@@ -145,8 +172,20 @@ def _convert_file(path: Path, out_path: Path) -> tuple[bool, str, int]:
             out_path, convert.rows_to_jsonl(rows))
     except OSError as exc:
         return False, f"could not write {out_path.name}: {exc}", 0
-    return True, (f"{path.name}: {len(rows)} rows. "
-                  f"{convert.describe_report(report)}"), len(rows)
+    # A clean convert adds no note: the run's one-line summary
+    # carries the row count once (T50), so repeating it here
+    # would print the same number three times. Skipped rows are
+    # still named (U32: never silently skip).
+    skipped = report.get("skipped") or {}
+    total_skipped = sum(skipped.values())
+    if total_skipped:
+        worst = max(skipped, key=lambda key: skipped[key])
+        row_word = "row" if total_skipped == 1 else "rows"
+        note = (f"{shown}: {total_skipped} {row_word} skipped "
+                f"(mostly: {worst}).")
+    else:
+        note = ""
+    return True, note, len(rows)
 
 
 def _hf_dataset_id(item: dict) -> str:
@@ -209,6 +248,10 @@ def download_and_convert(item: dict, out_dir: Path, token: str = "",
                     "rows": 0, "state": "found"}
     notes: list[str] = []
     source = item.get("source") or ""
+    if source not in ("Hugging Face", "GitHub"):
+        # A hand-added link (v0.1.4 T3): the source follows the
+        # URL, so a list saved before the fix still downloads.
+        source = core.source_for_url(item.get("url") or "")
     folder = dataset_folder_name(item)
     work_dir = Path(out_dir) / (".tmp-" + folder)
     target_dir = Path(out_dir) / folder
@@ -261,13 +304,34 @@ def download_and_convert(item: dict, out_dir: Path, token: str = "",
                     # (v0.1.3 T34).
                     notes.append(apis.compressed_note(name))
             if not picked:
-                report["message"] = ("No convertible files found. " +
-                                     (" ".join(notes) if notes else
-                                      "The dataset holds no .jsonl, .json, .csv, .tsv, or .parquet files."))
+                if notes:
+                    detail = " ".join(notes)
+                else:
+                    # Name what the dataset holds (v0.1.4 T30):
+                    # an image-only dataset says so, instead of
+                    # just listing the extensions it lacks.
+                    held = _unconvertible_description(found["files"])
+                    if held:
+                        detail = f"The dataset holds {held}."
+                    else:
+                        detail = ("The dataset holds no .jsonl, "
+                                  ".json, .csv, .tsv, or .parquet files.")
+                report["message"] = ("No convertible files found. "
+                                     + detail)
                 return report
             for name in picked[:MAX_FILES_PER_ITEM]:
                 if stopped():
                     break
+                # Refuse an over-cap file from its declared size
+                # before downloading it (v0.1.4 T25): the download
+                # itself still stops at the cap if the server lied.
+                declared = apis.content_length(
+                    apis.hf_file_url(dataset_id, name, "main"))
+                if (declared is not None
+                        and declared > MAX_DATA_FILE_BYTES):
+                    notes.append(
+                        f"skipped {name}: over the 200 MB file limit")
+                    continue
                 # Keep the folder in the work path: two files that
                 # share a basename in different folders must not
                 # overwrite each other before converting (T1).
@@ -387,11 +451,13 @@ def download_and_convert(item: dict, out_dir: Path, token: str = "",
             except zipfile.BadZipFile:
                 report["message"] = "The downloaded archive is not a zip file."
                 return report
+            seen_names: list[str] = []
             for path in sorted(extract_dir.rglob("*")):
                 if stopped():
                     break
                 if not path.is_file():
                     continue
+                seen_names.append(path.name)
                 if len(files) >= MAX_FILES_PER_ITEM:
                     notes.append(
                         f"only the first {MAX_FILES_PER_ITEM} files were tried")
@@ -416,9 +482,16 @@ def download_and_convert(item: dict, out_dir: Path, token: str = "",
             if not files:
                 # The archive downloaded and opened: say what it
                 # held (or did not), not that nothing downloaded.
+                if notes:
+                    detail = " " + " ".join(notes)
+                else:
+                    held = _unconvertible_description(seen_names)
+                    if held:
+                        detail = f" The repo holds {held}."
+                    else:
+                        detail = ""
                 report["message"] = (
-                    "No convertible files found in the repo."
-                    + (" " + " ".join(notes) if notes else ""))
+                    "No convertible files found in the repo." + detail)
                 return report
         else:
             url = item.get("url") or ""
@@ -443,6 +516,13 @@ def download_and_convert(item: dict, out_dir: Path, token: str = "",
                 # Refuse before downloading a file that cannot be
                 # converted (T62).
                 report["message"] = parquet.READER_MISSING_MESSAGE
+                return report
+            # Refuse an over-cap file from its declared size
+            # before downloading it (v0.1.4 T25): the download
+            # itself still stops at the cap if the server lied.
+            declared = apis.content_length(url)
+            if declared is not None and declared > MAX_DATA_FILE_BYTES:
+                report["message"] = _over_cap_message()
                 return report
             dest = work_dir / Path(clean_url).name
             say(f"Downloading {dest.name}")
@@ -495,11 +575,12 @@ def download_and_convert(item: dict, out_dir: Path, token: str = "",
             used_names.add(out_name)
             out_path = target_dir / out_name
             try:
-                ok, message, rows = _convert_file(path, out_path)
+                ok, message, rows = _convert_file(path, out_path, display)
             except Exception as exc:  # noqa: BLE001 - one bad file must not kill the run
                 notes.append(f"could not convert {display}: {exc}")
                 continue
-            notes.append(message)
+            if message:
+                notes.append(message)
             if ok:
                 outputs.append(str(out_path))
                 total_rows += rows
@@ -517,9 +598,15 @@ def download_and_convert(item: dict, out_dir: Path, token: str = "",
                         pass
             report.update({"ok": True, "outputs": outputs,
                            "rows": total_rows, "state": "converted"})
+            # One line, one number (T50): the count appears once,
+            # with no full path. Problem notes (skipped files)
+            # follow it; clean converts add nothing.
+            word = "file" if len(outputs) == 1 else "files"
             report["message"] = (
-                f"Wrote {len(outputs)} file(s), {total_rows} rows, to "
-                f"{target_dir}. " + " ".join(notes))
+                f"Converted {total_rows} rows into {len(outputs)} "
+                f"{word}.")
+            if notes:
+                report["message"] += " " + " ".join(notes)
         else:
             report["message"] = "Nothing converted. " + " ".join(notes)
         return report

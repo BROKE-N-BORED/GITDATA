@@ -165,6 +165,58 @@ class OfflineTests(LeapGuiTestCase):
         self.assertIn("Converted",
                       self.window.statusBar().currentMessage())
 
+    def test_convert_same_stem_files_in_two_folders(self):
+        # v0.1.4 T1: two files called train.jsonl in different
+        # folders convert to two outputs — the second convert
+        # must not destroy the first file's rows.
+        folder_a = Path(self.tmp.name) / "folder-a"
+        folder_b = Path(self.tmp.name) / "folder-b"
+        folder_a.mkdir()
+        folder_b.mkdir()
+        (folder_a / "train.jsonl").write_text(JSONL, encoding="utf-8")
+        other = ('{"prompt": "x", "completion": "y"}\n'
+                 '{"prompt": "z", "completion": "w"}\n')
+        (folder_b / "train.jsonl").write_text(other, encoding="utf-8")
+        with unittest.mock.patch(
+                "scout.gui.QFileDialog.getOpenFileName",
+                side_effect=[(str(folder_a / "train.jsonl"), ""),
+                             (str(folder_b / "train.jsonl"), "")]), \
+                unittest.mock.patch.object(
+                    QMessageBox, "question",
+                    return_value=QMessageBox.StandardButton.No):
+            self.window.convert_local_file()
+            self.window.convert_local_file()
+        out_dir = Path(self.tmp.name) / "stella-ready"
+        outputs = sorted(out_dir.glob("*.jsonl"))
+        self.assertEqual(len(outputs), 2)
+        names = [path.name for path in outputs]
+        self.assertIn("folder-a-train.jsonl", names)
+        self.assertIn("folder-b-train.jsonl", names)
+        first = (out_dir / "folder-a-train.jsonl").read_text(
+            encoding="utf-8")
+        second = (out_dir / "folder-b-train.jsonl").read_text(
+            encoding="utf-8")
+        self.assertIn('"prompt": "a"', first)
+        self.assertIn('"prompt": "x"', second)
+
+    def test_search_offline_without_cache_clears_stale_results(self):
+        # v0.1.4 T18: the previous search's results go away
+        # under the new query instead of reading as its answer.
+        self.window.results = [{
+            "title": "Old", "url": "https://example.com/old",
+            "source": "Hugging Face", "stars": 0, "updated": "",
+            "description": "", "license": "", "format": "",
+            "stella_status": ""}]
+        self.window._show_results()
+        self.assertEqual(self.window.results_table.rowCount(), 1)
+        self.window._set_online(False)
+        self.window.search_box.setCurrentText("a new query")
+        self.window.start_search()
+        self.assertEqual(self.window.results, [])
+        self.assertEqual(self.window.results_table.rowCount(), 0)
+        self.assertIn("offline",
+                      self.window.results_empty_label.text().lower())
+
 
 class WatchGuiTests(LeapGuiTestCase):
     def test_watch_button_saves_the_current_search(self):
@@ -225,6 +277,211 @@ class QueueGuiTests(LeapGuiTestCase):
         self.addCleanup(dialog.close)
         self.assertEqual(dialog.queue_table.rowCount(), 2)
         self.assertEqual(dialog.queue_table.item(0, 0).text(), "One")
+
+
+class WatchDialogV014Tests(LeapGuiTestCase):
+    """v0.1.4 T42/T43/T44/T46/T48: the watch dialog's buttons,
+    selection, and empty state."""
+
+    def _save_watch(self, query="math", new=None, enabled=True):
+        made = watch.new_watch(query, "reasoning")
+        made["enabled"] = enabled
+        if new:
+            made["new"] = new
+            made["new_seen"] = False
+        watch.save_watches([made])
+        return made
+
+    def test_empty_dialog_disables_buttons_and_teaches(self):
+        dialog = WatchDialog(self.window)
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.check_now_button.isEnabled())
+        self.assertFalse(dialog.add_new_button.isEnabled())
+        self.assertFalse(dialog.pause_button.isEnabled())
+        self.assertFalse(dialog.remove_button.isEnabled())
+        self.assertIn("Watch this search", dialog.new_label.text())
+
+    def test_pause_keeps_selection_and_shows_resume(self):
+        first = watch.new_watch("math", "reasoning")
+        second = watch.new_watch("stories", "reasoning")
+        watch.save_watches([first, second])
+        dialog = WatchDialog(self.window)
+        self.addCleanup(dialog.close)
+        dialog.watch_list.setCurrentRow(1)
+        dialog._toggle_paused()
+        self.assertEqual(dialog.watch_list.currentRow(), 1)
+        self.assertEqual(dialog.pause_button.text(), "Resume this watch")
+        self.assertTrue(dialog.pause_button.isEnabled())
+
+    def test_picking_a_watch_clears_the_flag_but_keeps_the_items(self):
+        self._save_watch("math", new=[{
+            "title": "Brand New", "url": "https://example.com/new",
+            "source": "Hugging Face"}])
+        dialog = WatchDialog(self.window)
+        self.addCleanup(dialog.close)
+        self.assertIn("1 new dataset",
+                      dialog.watch_list.item(0).text())
+        dialog.watch_list.setCurrentRow(0)
+        self.assertNotIn("new dataset",
+                         dialog.watch_list.item(0).text())
+        self.assertEqual(dialog.new_list.count(), 1)
+        self.assertEqual(dialog.new_list.item(0).text(), "Brand New")
+
+    def test_offline_check_now_says_so(self):
+        self._save_watch("math")
+        self.window._online = False
+        dialog = WatchDialog(self.window)
+        self.addCleanup(dialog.close)
+        dialog._check_now()
+        self.assertIn("offline",
+                      self.window.statusBar().currentMessage().lower())
+
+    def test_force_run_with_nothing_to_check_says_so(self):
+        self.window._online = True
+        self.window._run_due_watches(force=True)
+        self.assertIn("No watched searches to check right now.",
+                      self.window.statusBar().currentMessage())
+
+
+class QueueDialogV014Tests(LeapGuiTestCase):
+    """v0.1.4 T44/T45/T48: the queue dialog's buttons, retry,
+    and empty state."""
+
+    def test_empty_dialog_disables_buttons_and_teaches(self):
+        dialog = QueueDialog(self.window)
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.start_button.isEnabled())
+        self.assertFalse(dialog.retry_button.isEnabled())
+        self.assertFalse(dialog.remove_button.isEnabled())
+        self.assertFalse(dialog.clear_button.isEnabled())
+        self.assertFalse(dialog.empty_label.isHidden())
+        self.assertIn("Add selected to queue",
+                      dialog.empty_label.text())
+
+    def test_retry_failed_requeues_and_enables_start(self):
+        entries, _added = queue.enqueue(
+            [], {"title": "One", "url": "https://example.com/a",
+                 "source": "Hugging Face"})
+        entries[0]["state"] = queue.FAILED
+        entries[0]["error"] = "Download failed."
+        queue.save_queue(entries)
+        dialog = QueueDialog(self.window)
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.start_button.isEnabled())
+        self.assertTrue(dialog.retry_button.isEnabled())
+        dialog._retry_failed()
+        self.assertEqual(dialog.entries[0]["state"], queue.QUEUED)
+        self.assertEqual(dialog.entries[0]["error"], "")
+        self.assertTrue(dialog.start_button.isEnabled())
+        self.assertFalse(dialog.retry_button.isEnabled())
+        self.assertIn("queued again", dialog.log_view.toPlainText())
+
+    def test_retry_failed_only_retries_the_picked_row(self):
+        entries, _added = queue.enqueue(
+            [], {"title": "One", "url": "https://example.com/a",
+                 "source": "Hugging Face"})
+        entries, _added = queue.enqueue(
+            entries, {"title": "Two", "url": "https://example.com/b",
+                      "source": "Hugging Face"})
+        entries[0]["state"] = queue.FAILED
+        entries[1]["state"] = queue.FAILED
+        queue.save_queue(entries)
+        dialog = QueueDialog(self.window)
+        self.addCleanup(dialog.close)
+        dialog.queue_table.selectRow(1)
+        dialog._retry_failed()
+        self.assertEqual(dialog.entries[0]["state"], queue.FAILED)
+        self.assertEqual(dialog.entries[1]["state"], queue.QUEUED)
+
+    def test_remove_enables_only_with_a_selection(self):
+        entries, _added = queue.enqueue(
+            [], {"title": "One", "url": "https://example.com/a",
+                 "source": "Hugging Face"})
+        queue.save_queue(entries)
+        dialog = QueueDialog(self.window)
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.remove_button.isEnabled())
+        dialog.queue_table.selectRow(0)
+        self.assertTrue(dialog.remove_button.isEnabled())
+
+    def test_refresh_mid_run_keeps_the_running_row(self):
+        # v0.1.4 T14: while a run is in progress the in-memory
+        # entries are the truth — no disk reload, no false
+        # "stopped part way through" line, and "Downloading" shows.
+        entries, _added = queue.enqueue(
+            [], {"title": "One", "url": "https://example.com/a",
+                 "source": "Hugging Face"})
+        queue.save_queue(entries)
+        dialog = QueueDialog(self.window)
+        self.addCleanup(dialog.close)
+        dialog.entries[0]["state"] = queue.RUNNING
+        dialog.worker = unittest.mock.Mock()
+        dialog.worker.isRunning.return_value = True
+        dialog.refresh()
+        self.assertEqual(dialog.entries[0]["state"], queue.RUNNING)
+        self.assertEqual(dialog.queue_table.item(0, 1).text(),
+                         "Downloading")
+        self.assertNotIn("stopped part way",
+                         dialog.log_view.toPlainText())
+
+    def test_entry_done_marks_the_list_item_converted(self):
+        # v0.1.4 T15: a queue run marks the matching My List row
+        # converted, by URL.
+        item = {"title": "One", "url": "https://example.com/a",
+                "source": "Hugging Face", "state": "found"}
+        self.window.my_list = [dict(item)]
+        core.save_list(self.window.my_list)
+        self.window._refresh_list_tab()
+        entries, _added = queue.enqueue([], dict(item))
+        queue.save_queue(entries)
+        dialog = QueueDialog(self.window)
+        self.addCleanup(dialog.close)
+        entry_id = dialog.entries[0]["id"]
+        dialog._on_entry_done(entry_id, True, "Converted 2 rows.",
+                              ["/tmp/out.jsonl"], 2, "converted")
+        self.assertEqual(self.window.my_list[0]["state"], "converted")
+        self.assertEqual(core.load_list()[0]["state"], "converted")
+
+    def test_paused_entry_logs_a_pause_not_a_failure(self):
+        # v0.1.4 T14: a clean pause logs "Paused", not the
+        # failure report "Nothing could be downloaded."
+        entries, _added = queue.enqueue(
+            [], {"title": "One", "url": "https://example.com/a",
+                 "source": "Hugging Face"})
+        queue.save_queue(entries)
+        dialog = QueueDialog(self.window)
+        self.addCleanup(dialog.close)
+        entry_id = dialog.entries[0]["id"]
+        dialog._on_entry_done(entry_id, False,
+                              "Nothing could be downloaded.",
+                              [], 0, "stopped")
+        self.assertIn("Paused. Start resumes the download.",
+                      dialog.log_view.toPlainText())
+        self.assertNotIn("Nothing could be downloaded.",
+                         dialog.log_view.toPlainText())
+        self.assertEqual(dialog.entries[0]["state"], queue.QUEUED)
+
+
+class DownloadDialogV014Tests(LeapGuiTestCase):
+    """v0.1.4 T16/T30: a run that converted nothing ends at 0
+    with no checkmark, and Open the folder stays disabled."""
+
+    def test_zero_conversion_run_has_no_checkmark(self):
+        item = {"title": "One", "url": "https://example.com/a",
+                "source": "Hugging Face", "state": "found"}
+        dialog = DownloadDialog(
+            [(0, item)], Path(self.tmp.name) / "out",
+            parent=self.window)
+        self.addCleanup(dialog.close)
+        dialog._on_item_done(0, False, "Nothing could be downloaded.",
+                             [], 0, "found")
+        dialog._on_all_done(False)
+        self.assertEqual(dialog.bar.value(), 0)
+        self.assertNotIn("✓", dialog.log_view.toPlainText())
+        self.assertIn("Nothing converted.",
+                      dialog.log_view.toPlainText())
+        self.assertFalse(dialog.open_button.isEnabled())
+        self.assertTrue(dialog.close_button.isEnabled())
 
 
 class StellaLinkGuiTests(LeapGuiTestCase):

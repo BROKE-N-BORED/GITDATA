@@ -1,5 +1,75 @@
 # Changelog
 
+## v0.1.4 (2026-11-17)
+
+All 65 items from the v0.1.3 user-experience review, in one release.
+
+- T1: "Convert a file on this PC" keeps the folder in the output name, so two files called train.jsonl no longer overwrite each other
+- T2: The STELLA Replace checkbox compares file contents, so a different dataset is never silently swapped in with Replace unchecked
+- T3: A link added by hand gets its source from the URL, so pasted Hugging Face and GitHub links can be checked and downloaded
+- T4: The installer now installs the Parquet reader (pyarrow, about 169 MB on disk), so Parquet datasets convert on a real install; the reader stays optional and loads only when needed
+- T5: An empty search box or watch says "Type a few words first" and does nothing, instead of silently searching for "dataset"
+- T6: A rejected GitHub token is named on screen, with the fix, instead of only in the log
+- T7: "Copy debug report" includes the on-disk log tail, so a report from a previous session is not empty
+- T8: No red errors show after a website is added successfully
+- T9: The installer prints the real PySide6 import error instead of guessing network or disk space
+- T10: Parquet datasets are peeked for usable columns before the badge promises a conversion
+- T11: Sniffing a repo peeks past the first .jsonl instead of judging one file
+- T12: "Checked, no usable fields" has its own status instead of "Check failed"
+- T13: The score cell refreshes when the STELLA badge lands, so the two columns no longer contradict each other
+- T14: The queue log no longer claims a normal run was stopped, and "Downloading" shows during a run
+- T15: A queue run marks the My List row converted, like a single download does
+- T16: A download run that converts nothing shows a plain "Nothing converted" state, no checkmark and no full bar
+- T17: The STELLA check summary counts ready, convertible, and failed instead of only the ready count
+- T18: An offline search with no cached results clears the stale rows instead of leaving the previous search under the new query
+- T19: prompt+response and question+ground_truth rows map, and the skip reason says which field is actually missing
+- T20: A dataset STELLA cannot use can no longer score "Worth a look" or "Promising"
+- T21: A junk token gets one honest message instead of a success line plus a red error
+- T22: A link that fails the app's own check is not added to My List
+- T23: A failed search says so in one plain sentence, no error code twice
+- T24: Import and export failures are plain sentences, no raw errors or full paths
+- T25: An over-cap file is refused from its declared size before downloading, in every branch
+- T26: Blanking a title no longer claims success while silently keeping the old one
+- T27: Link-check Stop drops the in-flight check at once and counts only what was actually checked
+- T28: The STELLA format note is plain words instead of raw schema
+- T29: After a failed search the label says the search failed instead of the never-searched text
+- T30: Small wrongs swept: installer size says about 200 MB, report messages name the folder, queue intro corrected, image-only downloads name what the dataset holds, "Open the folder" stays disabled after a failed run
+- T31: The Search tab fits at 1100x700: results, Add buttons, Load more, and the STELLA and Score columns all visible without scrolling
+- T32: The My List Title column is capped so State, STELLA, and Score stay visible at 1366 wide
+- T33: The status text gets priority over the permanent status-bar widgets, so messages are no longer clipped
+- T34: "Clear all" on an empty list says there is nothing to clear
+- T35: Answering No to a confirm says what was kept instead of leaving a stale message
+- T36: The setup checklist shows its final tick for a beat before hiding
+- T37: "Add all results" with no results says there is nothing to add instead of "Added 0"
+- T38: Scores and tooltips say "1 week ago", not "1 week(s) ago"
+- T39: The Sources Remove column is sized to its button instead of taking most of the table
+- T40: The installer only promises a desktop icon when one was actually placed
+- T41: The detail view caps the file list at 5 with "and N more" instead of one endless line
+- T42: Watch "new" flags survive quiet runs until the user has seen them
+- T43: The watch dialog keeps its selection on refresh and shows "Resume this watch" for paused watches
+- T44: Watch and Queue dialog buttons are disabled when there is nothing to act on
+- T45: Failed queue entries can be retried from the dialog
+- T46: An offline Check now says the app is offline instead of staying silent
+- T47: Collapsible-section state is remembered across restarts
+- T48: The Watch and Queue empty states teach how to fill them
+- T49: The detail pane's link is clickable
+- T50: The download success log is one line with one number and no full path
+- T51: Check STELLA-ready with nothing selected checks the whole list, like link check
+- T52: The shortcuts overlay teaches Enter, Ctrl+A, and double-click
+- T53: A .bak recovery is recorded in About so it survives the next status update
+- T54: The Sources empty-state guidance sits above the table, where the eye lands first
+- T55: Search results have a "Find in these results" filter box, like My List
+- T56: A converted row has actions to open its converted file or folder
+- T57: My List has a Score column, kept in step with the result it came from
+- T58: The Edit dialog lets you fix a mistyped URL, with the same inline check as adding
+- T59: Edits can be undone, like removes
+- T60: "Add a link I found" is in the File menu and on My List, not only on the Search tab
+- T61: A download history records what was converted, when, and how many rows
+- T62: "Remove the dead ones" tidies all dead rows after a link check
+- T63: Links can move between collections
+- T64: The Help menu runs the self-test in the app and shows the plain-words result
+- T65: The Active-only 12-month default stays as it is; the user's own window choice now persists across restarts (the default itself is still Joshua's call)
+
 ## v0.1.3 (2026-11-15)
 
 All 67 items from the v0.1.2 audit, in one release.

@@ -95,6 +95,19 @@ class GithubApiTests(unittest.TestCase):
                 apis.search_github("q", "all")
         self.assertIn("Could not reach the internet", str(ctx.exception))
 
+    def test_network_failure_has_no_errno(self):
+        # v0.1.4 T23: the raw reason carries errno jargon the
+        # user cannot act on, so it is not shown.
+        reason = OSError(-2, "Name or service not known")
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=urllib.error.URLError(reason)):
+            with self.assertRaises(apis.SearchError) as ctx:
+                apis.search_github("q", "all")
+        self.assertNotIn("Errno", str(ctx.exception))
+        self.assertEqual(str(ctx.exception),
+                         "Could not reach the internet. Check the "
+                         "connection and try again.")
+
     def test_search_page_is_passed_to_github(self):
         # v0.1.3 T22: Load more asks GitHub for the next page.
         with mock.patch("urllib.request.urlopen",
@@ -267,13 +280,98 @@ class SniffTests(unittest.TestCase):
         self.assertEqual(result["status"], "convert")
 
     def test_hf_parquet_only_is_convert(self):
+        # v0.1.4 T10: the columns are peeked before any
+        # conversion is promised.
         detail = {"siblings": [{"rfilename": "data/train.parquet"}],
                   "usedStorage": 99}
         with mock.patch("urllib.request.urlopen",
-                        return_value=FakeResponse(detail)):
+                        return_value=FakeResponse(detail)), \
+                mock.patch("scout.parquet.read_remote_columns",
+                           return_value=["prompt", "completion"]):
             result = apis.sniff_huggingface("acme/tiny")
         self.assertEqual(result["status"], "convert")
-        self.assertIn("parquet", result["detail"])
+        self.assertIn("Parquet columns", result["detail"])
+        self.assertIn("prompt", result["detail"])
+
+    def test_hf_parquet_text_only_columns_are_no_fields(self):
+        # v0.1.4 T10/T12: a single-text-column Parquet file is
+        # checked and unusable, not a promised conversion and
+        # not a failed check.
+        detail = {"siblings": [{"rfilename": "data/train.parquet"}],
+                  "usedStorage": 99}
+        with mock.patch("urllib.request.urlopen",
+                        return_value=FakeResponse(detail)), \
+                mock.patch("scout.parquet.read_remote_columns",
+                           return_value=["text"]):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "no-fields")
+        self.assertIn("none had fields Scout can use", result["detail"])
+
+    def test_hf_parquet_unreadable_is_unknown_not_convert(self):
+        # v0.1.4 T10: when the columns cannot be read, the shape
+        # is not checked — never a promised conversion.
+        detail = {"siblings": [{"rfilename": "data/train.parquet"}],
+                  "usedStorage": 99}
+        with mock.patch("urllib.request.urlopen",
+                        return_value=FakeResponse(detail)), \
+                mock.patch(
+                    "scout.parquet.read_remote_columns",
+                    side_effect=apis.parquet.ParquetError("down")):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "unknown")
+        self.assertIn("shape not checked", result["detail"])
+
+    def test_sniff_peeks_past_the_first_jsonl(self):
+        # v0.1.4 T11: the first .jsonl is text-only, the second
+        # maps — the repo converts.
+        detail = {"siblings": [{"rfilename": "first.jsonl"},
+                               {"rfilename": "second.jsonl"}],
+                  "usedStorage": 99}
+        mapping = [
+            ("api/datasets/acme/tiny", FakeResponse(detail)),
+            ("resolve/main/first.jsonl",
+             FakeResponse('{"text": "plain"}\n{"text": "plain"}\n')),
+            ("resolve/main/second.jsonl",
+             FakeResponse(self.JSONL)),
+        ]
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=self._route(mapping)):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "ready")
+
+    def test_sniff_all_unmappable_jsonl_is_no_fields(self):
+        # v0.1.4 T12: every .jsonl was read and none had usable
+        # fields — a final answer, not "Check failed".
+        detail = {"siblings": [{"rfilename": "a.jsonl"},
+                               {"rfilename": "b.jsonl"}],
+                  "usedStorage": 99}
+        mapping = [
+            ("api/datasets/acme/tiny", FakeResponse(detail)),
+            ("resolve/main/a.jsonl",
+             FakeResponse('{"text": "plain"}\n{"text": "plain"}\n')),
+            ("resolve/main/b.jsonl",
+             FakeResponse('{"text": "plain"}\n{"text": "plain"}\n')),
+        ]
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=self._route(mapping)):
+            result = apis.sniff_huggingface("acme/tiny")
+        self.assertEqual(result["status"], "no-fields")
+
+    def test_sniff_item_derives_source_from_url(self):
+        # v0.1.4 T3: a hand-added link to Hugging Face is
+        # checked like a searched one.
+        detail = {"siblings": [{"rfilename": "train.jsonl"}],
+                  "usedStorage": 1}
+        mapping = [
+            ("api/datasets/acme/tiny", FakeResponse(detail)),
+            ("resolve/main/train.jsonl", FakeResponse(self.JSONL)),
+        ]
+        item = {"source": "Found by hand", "title": "acme/tiny",
+                "url": "https://huggingface.co/datasets/acme/tiny"}
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=self._route(mapping)):
+            result = apis.sniff_item(item)
+        self.assertEqual(result["status"], "ready")
 
     def test_hf_no_data_files(self):
         detail = {"siblings": [{"rfilename": "README.md"}],

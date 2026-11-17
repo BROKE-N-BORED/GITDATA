@@ -198,6 +198,36 @@ class HfParseTests(unittest.TestCase):
         self.assertEqual(items[2]["license"], "odc-by")
 
 
+class SourceForUrlTests(unittest.TestCase):
+    # v0.1.4 T3: a hand-added link gets its source from its URL,
+    # because the sniff and download dispatch on source.
+    def test_huggingface_dataset_url(self):
+        self.assertEqual(
+            core.source_for_url(
+                "https://huggingface.co/datasets/acme/tiny"),
+            "Hugging Face")
+
+    def test_github_url(self):
+        self.assertEqual(
+            core.source_for_url("https://github.com/acme/tiny"),
+            "GitHub")
+
+    def test_huggingface_non_dataset_url_is_hand_found(self):
+        self.assertEqual(
+            core.source_for_url("https://huggingface.co/acme/tiny"),
+            "Found by hand")
+
+    def test_direct_file_url_is_hand_found(self):
+        self.assertEqual(
+            core.source_for_url("https://example.com/train.jsonl"),
+            "Found by hand")
+
+    def test_blank_or_broken_url_is_hand_found(self):
+        self.assertEqual(core.source_for_url(""), "Found by hand")
+        self.assertEqual(core.source_for_url("not a link"),
+                         "Found by hand")
+
+
 class SourcesTests(TempHomeMixin, unittest.TestCase):
     def test_defaults_on_first_run(self):
         sites = core.load_sources()
@@ -387,6 +417,19 @@ class TokenScrubTests(TempHomeMixin, unittest.TestCase):
         self.assertNotIn(self.TOKEN, report)
         self.assertIn("***", report)
         self.assertIn("Dataset Scout", report)
+
+    def test_debug_report_reads_log_from_disk(self):
+        # v0.1.4 T7: the report shows the on-disk log, so a
+        # crash from a previous session is visible even though
+        # the in-memory ring is empty.
+        core.log("first session crashed here")
+        core._RING.clear()
+        report = core.debug_report()
+        self.assertIn("first session crashed here", report)
+
+    def test_debug_report_says_when_log_is_empty(self):
+        report = core.debug_report()
+        self.assertIn("(No log lines yet.)", report)
 
     def test_log_error_captures_traceback(self):
         try:

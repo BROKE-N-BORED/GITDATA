@@ -12,6 +12,11 @@ open, so the user can see why a result scored what it did:
 - STELLA shape, 0-20: already in STELLA's shape beats convertible
   beats no data files; not checked yet sits in the middle instead
   of being punished for something the user has not asked about.
+
+A dataset with no usable files never reaches the top bands
+(v0.1.4 T20): however active or popular it is, its score stops
+below "Promising", so the band reflects usability, not just
+popularity.
 """
 
 from __future__ import annotations
@@ -57,11 +62,14 @@ def _activity_points(item: dict, now: datetime) -> tuple[int, str]:
     if age_days < 7:
         when = "this week"
     elif age_days < 30:
-        when = f"{age_days // 7} week(s) ago"
+        count = age_days // 7
+        when = f"{count} week ago" if count == 1 else f"{count} weeks ago"
     elif age_days < 365:
-        when = f"{age_days // 30} month(s) ago"
+        count = age_days // 30
+        when = f"{count} month ago" if count == 1 else f"{count} months ago"
     else:
-        when = f"{age_days // 365} year(s) ago"
+        count = age_days // 365
+        when = f"{count} year ago" if count == 1 else f"{count} years ago"
     return points, f"Updated {when}"
 
 
@@ -94,12 +102,26 @@ def _shape_points(item: dict) -> tuple[int, str]:
     if status == "convert":
         return 12, "Converts to STELLA shape"
     if status == "none":
-        return 0, "No data files found"
+        return 0, "No data files found, so the score stays below Promising"
+    if status == "unsupported":
+        return 0, ("Cannot convert these files, "
+                   "so the score stays below Promising")
+    if status == "no-fields":
+        return 0, ("Checked, no fields Scout can use, "
+                   "so the score stays below Promising")
     if status == "needs-reader":
         return 5, "Needs the Parquet reader to check"
     if status == "unknown":
         return 5, "STELLA check could not read it"
     return 5, "STELLA shape not checked yet"
+
+
+# A dataset with no usable files never scores above this (v0.1.4
+# T20): 49 is the top of "Maybe", so the top bands stay out of
+# reach however active or popular the dataset is.
+_UNUSABLE_SCORE_CAP = 49
+
+_UNUSABLE_STATUSES = ("none", "unsupported", "no-fields")
 
 
 def score_item(item: dict, now: datetime | None = None) -> dict:
@@ -116,6 +138,8 @@ def score_item(item: dict, now: datetime | None = None) -> dict:
         _shape_points(item),
     ]
     total = sum(points for points, _reason in parts)
+    if item.get("stella_status") in _UNUSABLE_STATUSES:
+        total = min(total, _UNUSABLE_SCORE_CAP)
     score = max(0, min(100, total))
     return {
         "score": score,

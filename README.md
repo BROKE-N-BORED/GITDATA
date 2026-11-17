@@ -24,6 +24,10 @@ Scout** in the app menu with its magnifier icon, and puts a **Dataset
 Scout** icon on the desktop. After that, just click it. No terminal
 needed to run it.
 
+The one-time download is about 200 MB: the interface toolkit plus
+the Parquet reader (pyarrow, about 169 MB on disk once installed),
+so Parquet datasets convert too.
+
 To launch from a terminal instead:
 
 `bash run.sh`

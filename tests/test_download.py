@@ -14,6 +14,25 @@ from pathlib import Path
 
 from scout import apis, download
 
+# The download path asks for each file's declared size before
+# downloading it (v0.1.4 T25). The network is mocked at the apis
+# boundary in this module, so the size lookup answers "unknown"
+# by default; tests that need a declared size patch it
+# themselves.
+_CONTENT_LENGTH_PATCHER = None
+
+
+def setUpModule():
+    global _CONTENT_LENGTH_PATCHER
+    _CONTENT_LENGTH_PATCHER = unittest.mock.patch.object(
+        apis, "content_length", return_value=None)
+    _CONTENT_LENGTH_PATCHER.start()
+
+
+def tearDownModule():
+    if _CONTENT_LENGTH_PATCHER is not None:
+        _CONTENT_LENGTH_PATCHER.stop()
+
 JSONL = ('{"prompt": "a", "completion": "b"}\n'
          '{"prompt": "c", "completion": "d"}\n')
 CSV = "prompt,completion\nWhat?,That.\nWho?,Them.\n"
@@ -148,6 +167,37 @@ class HuggingFaceDownloadTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["state"], "found")
         self.assertIn("No convertible files", report["message"])
+
+    def test_image_only_dataset_names_what_it_holds(self):
+        # v0.1.4 T30d: the message names the image files instead
+        # of listing the formats the dataset does not hold.
+        with unittest.mock.patch.object(
+                apis, "sniff_huggingface",
+                return_value={"status": "none",
+                              "files": ["a.png", "b.jpg"],
+                              "total_size": 100, "detail": ""}):
+            report = download.download_and_convert(_hf_item(), self.out)
+        self.assertFalse(report["ok"])
+        self.assertIn("The dataset holds only .jpg and .png files.",
+                      report["message"])
+
+    def test_over_cap_file_is_refused_before_downloading(self):
+        # v0.1.4 T25: the declared size is checked first, so a
+        # 300 MB file is refused without downloading any of it.
+        with unittest.mock.patch.object(
+                apis, "sniff_huggingface",
+                return_value={"status": "ready",
+                              "files": ["data/train.jsonl"],
+                              "total_size": 100, "detail": ""}), \
+                unittest.mock.patch.object(
+                    apis, "content_length",
+                    return_value=download.MAX_DATA_FILE_BYTES + 1), \
+                unittest.mock.patch.object(
+                    apis, "download_file") as fake_download:
+            report = download.download_and_convert(_hf_item(), self.out)
+        fake_download.assert_not_called()
+        self.assertFalse(report["ok"])
+        self.assertIn("over the 200 MB file limit", report["message"])
 
     def test_sniff_failure_reports_plainly(self):
         with unittest.mock.patch.object(
@@ -351,6 +401,46 @@ class DirectLinkTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["rows"], 2)
 
+    def test_success_message_is_one_line_with_one_number(self):
+        # v0.1.4 T50: "Converted 2 rows into 1 file." — the count
+        # once, no full path, no "(s)".
+        def fake_download(url, dest, progress=None, chunk=262144,
+                          limit=None, stop=None):
+            Path(dest).write_text(JSONL, encoding="utf-8")
+            return len(JSONL)
+
+        item = {"title": "Direct JSONL", "source": "Found by hand",
+                "url": "https://example.com/data.jsonl"}
+        with unittest.mock.patch.object(
+                apis, "download_file", side_effect=fake_download):
+            report = download.download_and_convert(item, self.out)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["message"],
+                         "Converted 2 rows into 1 file.")
+        self.assertNotIn(str(self.out), report["message"])
+        self.assertNotIn("(s)", report["message"])
+
+    def test_clean_convert_adds_no_note_but_skips_are_named(self):
+        # v0.1.4 T50: a clean file adds no per-file note (the
+        # summary carries the count), but skipped rows stay named.
+        clean = Path(self.tmp.name) / "clean.jsonl"
+        clean.write_text(JSONL, encoding="utf-8")
+        out = Path(self.tmp.name) / "clean-out.jsonl"
+        ok, note, rows = download._convert_file(clean, out)
+        self.assertTrue(ok)
+        self.assertEqual(note, "")
+        self.assertEqual(rows, 2)
+        mixed = Path(self.tmp.name) / "mixed.jsonl"
+        mixed.write_text(
+            JSONL + '{"text": "no prompt or completion here"}\n',
+            encoding="utf-8")
+        out2 = Path(self.tmp.name) / "mixed-out.jsonl"
+        ok, note, rows = download._convert_file(mixed, out2)
+        self.assertTrue(ok)
+        self.assertEqual(rows, 2)
+        self.assertIn("1 row skipped", note)
+        self.assertNotIn("2 rows", note)
+
     def test_direct_parquet_link_converts(self):
         # T62: a direct link to a Parquet file converts when the
         # reader is installed.
@@ -394,6 +484,22 @@ class DirectLinkTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertIn("Parquet reader", report["message"])
         fake_download.assert_not_called()
+
+    def test_direct_over_cap_file_is_refused_before_downloading(self):
+        # v0.1.4 T25: the declared size is checked first, so a
+        # 300 MB direct link is refused without downloading
+        # any of it.
+        item = {"title": "Direct CSV", "source": "Found by hand",
+                "url": "https://example.com/data.csv"}
+        with unittest.mock.patch.object(
+                apis, "content_length",
+                return_value=download.MAX_DATA_FILE_BYTES + 1), \
+                unittest.mock.patch.object(
+                    apis, "download_file") as fake_download:
+            report = download.download_and_convert(item, self.out)
+        fake_download.assert_not_called()
+        self.assertFalse(report["ok"])
+        self.assertIn("bigger than 200.0 MB", report["message"])
 
 
 class StopTests(unittest.TestCase):

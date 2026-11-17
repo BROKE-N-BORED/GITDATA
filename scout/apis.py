@@ -97,8 +97,12 @@ def _read_json(url: str, headers: dict | None = None,
     except urllib.error.HTTPError as exc:
         raise _http_error(exc, source, endpoint) from exc
     except urllib.error.URLError as exc:
+        # No raw reason (v0.1.4 T23): it carries errno jargon like
+        # "[Errno -2] Name or service not known", which the user
+        # cannot act on. The cause and the fix are the same
+        # whatever the underlying error was.
         raise SearchError(
-            f"Could not reach the internet: {exc.reason}. "
+            "Could not reach the internet. "
             "Check the connection and try again."
         ) from exc
     except http.client.HTTPException as exc:
@@ -373,13 +377,28 @@ def _can_convert_file(name: str) -> bool:
     return any(lowered.endswith(ext) for ext in convert.CONVERTIBLE)
 
 
-def _sniff_files(names: list[str], total_size, peek) -> dict:
-    """Shared sniff logic. peek(filename) judges one .jsonl file."""
+# How many files the sniff peeks before judging (v0.1.4 T11):
+# the first file may be text-only while a later one maps, but
+# each peek is a network round trip, so the sniff stops here.
+MAX_SNIFF_PEEKS = 5
+
+
+def _sniff_files(names: list[str], total_size, peek,
+                 parquet_peek=None) -> dict:
+    """Shared sniff logic. peek(filename) judges one .jsonl file;
+    parquet_peek(filename) judges one .parquet file by its
+    columns, when given."""
     data_files = [name for name in names if _is_data_file(name)]
     compressed = [name for name in names if compressed_data_ext(name)]
     files = data_files + compressed
     if not files:
-        return {"status": "none", "files": [], "total_size": total_size,
+        # No data files at all. Keep a few of the names anyway
+        # (v0.1.4 T30d): the download message names what the
+        # dataset holds ("only .png and .jpg files") instead of
+        # listing formats it does not hold. Capped so a big
+        # file list does not bloat the saved item.
+        return {"status": "none", "files": names[:20],
+                "total_size": total_size,
                 "detail": "no data files found"}
     if not data_files:
         # Only compressed data files (v0.1.3 T34): name them
@@ -390,28 +409,63 @@ def _sniff_files(names: list[str], total_size, peek) -> dict:
     jsonl = [name for name in data_files
              if name.lower().endswith(".jsonl")]
     if jsonl:
-        shape, detail = peek(jsonl[0])
-        if shape == "ready":
-            return {"status": "ready", "files": files,
+        # Peek past the first file (v0.1.4 T11): judge until one
+        # maps, instead of condemning the whole repo on one
+        # text-only file.
+        checked = 0
+        read = 0
+        last_detail = ""
+        for name in jsonl[:MAX_SNIFF_PEEKS]:
+            shape, detail = peek(name)
+            checked += 1
+            last_detail = detail
+            if shape == "ready":
+                return {"status": "ready", "files": files,
+                        "total_size": total_size, "detail": detail}
+            if shape == "convert":
+                return {"status": "convert", "files": files,
+                        "total_size": total_size, "detail": detail}
+            if shape == "unmappable":
+                read += 1
+                continue
+            # "unknown": this file could not be read; try the next.
+        if read and read == checked:
+            # Every file peeked was read, and none had usable
+            # fields (v0.1.4 T12): a final answer, not a failure.
+            if len(jsonl) > checked:
+                detail = (f"checked {checked} of {len(jsonl)} .jsonl "
+                          "files, none had fields Scout can use")
+            elif checked == 1:
+                detail = (f"checked {jsonl[0]}, it has no fields "
+                          "Scout can use")
+            else:
+                detail = (f"checked {checked} .jsonl files, none had "
+                          "fields Scout can use")
+            return {"status": "no-fields", "files": files,
                     "total_size": total_size, "detail": detail}
-        if shape == "convert":
-            return {"status": "convert", "files": files,
-                    "total_size": total_size, "detail": detail}
+        if read:
+            detail = (f"checked {read} .jsonl file(s) with no usable "
+                      "fields, and the rest could not be read")
+        else:
+            detail = (f"has .jsonl ({jsonl[0]}), shape not checked: "
+                      f"{last_detail}")
         # A peek that failed is "unknown", not "convert" (v0.1.3
         # T26): Scout must not promise a conversion it could not
         # even check.
         return {"status": "unknown", "files": files,
-                "total_size": total_size,
-                "detail": f"has .jsonl ({jsonl[0]}), shape not checked: "
-                          f"{detail}"}
+                "total_size": total_size, "detail": detail}
     kinds = sorted({name.rsplit(".", 1)[-1].lower()
                     for name in data_files if "." in name})
     if all(name.lower().endswith(".parquet") for name in data_files):
-        # Parquet-only (T62): it genuinely converts when the
-        # reader is installed; without it, the status says so
-        # honestly instead of promising a conversion that will
-        # refuse. Mixed layouts are judged below.
+        # Parquet-only (T62): the columns are peeked before any
+        # conversion is promised (v0.1.4 T10); without the reader,
+        # the status says so honestly instead of promising a
+        # conversion that will refuse. Mixed layouts are judged
+        # below.
         if parquet.reader_available():
+            if parquet_peek is not None:
+                return _sniff_parquet_files(
+                    data_files, files, total_size, parquet_peek)
             return {"status": "convert", "files": files,
                     "total_size": total_size,
                     "detail": "has data files (parquet), converts to "
@@ -445,6 +499,59 @@ def _sniff_files(names: list[str], total_size, peek) -> dict:
             "total_size": total_size, "detail": detail}
 
 
+def _judge_parquet_columns(columns: list[str]) -> tuple[str, str]:
+    """A Parquet file's columns as a sniff verdict (v0.1.4 T10)."""
+    if not columns:
+        return "unmappable", "the file has no columns"
+    shown = ", ".join(columns[:5])
+    if convert.columns_map(columns):
+        return "convert", (f"Parquet columns ({shown}) map to "
+                           "STELLA's shape with conversion")
+    return "unmappable", (f"Parquet columns ({shown}) have no fields "
+                          "Scout can map")
+
+
+def _sniff_parquet_files(data_files: list[str], files: list[str],
+                         total_size, parquet_peek) -> dict:
+    """Judge Parquet-only datasets by their columns (v0.1.4 T10).
+
+    Like the .jsonl peek: judge until one file maps, and say
+    plainly when the shape could not be checked instead of
+    promising a conversion.
+    """
+    parquet_files = [name for name in data_files
+                     if name.lower().endswith(".parquet")]
+    checked = 0
+    read = 0
+    last_detail = ""
+    for name in parquet_files[:MAX_SNIFF_PEEKS]:
+        shape, detail = parquet_peek(name)
+        checked += 1
+        last_detail = detail
+        if shape == "convert":
+            return {"status": "convert", "files": files,
+                    "total_size": total_size, "detail": detail}
+        if shape == "ready":
+            return {"status": "ready", "files": files,
+                    "total_size": total_size, "detail": detail}
+        if shape == "unmappable":
+            read += 1
+            continue
+    if read and read == checked:
+        if len(parquet_files) > checked:
+            detail = (f"checked {checked} of {len(parquet_files)} "
+                      "Parquet files, none had fields Scout can use")
+        else:
+            detail = (f"checked {checked} Parquet file(s), none had "
+                      "fields Scout can use")
+        return {"status": "no-fields", "files": files,
+                "total_size": total_size, "detail": detail}
+    return {"status": "unknown", "files": files,
+            "total_size": total_size,
+            "detail": f"has Parquet files, shape not checked: "
+                      f"{last_detail}"}
+
+
 def hf_file_url(dataset_id: str, filename: str,
                 branch: str = "main") -> str:
     return ("https://huggingface.co/datasets/"
@@ -459,6 +566,18 @@ def _hf_peek(dataset_id: str, filename: str,
             if total is not None and size_holder is not None:
                 size_holder["total"] = total
             return convert.peek_shape(text)
+    return "unknown", "could not read the file to check its shape"
+
+
+def _hf_parquet_peek(dataset_id: str, filename: str) -> tuple[str, str]:
+    """Judge one Hugging Face Parquet file by its columns."""
+    for branch in ("main", "master"):
+        try:
+            columns = parquet.read_remote_columns(
+                hf_file_url(dataset_id, filename, branch))
+        except parquet.ParquetError:
+            continue
+        return _judge_parquet_columns(columns)
     return "unknown", "could not read the file to check its shape"
 
 
@@ -489,7 +608,8 @@ def sniff_huggingface(dataset_id: str) -> dict:
     peeked_size: dict = {}
     result = _sniff_files(
         names, total if isinstance(total, int) else None,
-        lambda filename: _hf_peek(dataset_id, filename, peeked_size))
+        lambda filename: _hf_peek(dataset_id, filename, peeked_size),
+        lambda filename: _hf_parquet_peek(dataset_id, filename))
     if peeked_size.get("total") is not None:
         result["total_size"] = peeked_size["total"]
     return result
@@ -508,6 +628,18 @@ def _github_peek(owner_repo: str, branch: str,
     if text is None:
         return "unknown", "could not read the file to check its shape"
     return convert.peek_shape(text)
+
+
+def _github_parquet_peek(owner_repo: str, branch: str,
+                         path: str) -> tuple[str, str]:
+    """Judge one GitHub Parquet file by its columns."""
+    url = ("https://raw.githubusercontent.com/"
+           f"{owner_repo}/{branch}/{quote(path, safe='/')}")
+    try:
+        columns = parquet.read_remote_columns(url)
+    except parquet.ParquetError:
+        return "unknown", "could not read the file to check its shape"
+    return _judge_parquet_columns(columns)
 
 
 def sniff_github(owner_repo: str, token: str = "") -> dict:
@@ -552,7 +684,8 @@ def sniff_github(owner_repo: str, token: str = "") -> dict:
                 and _is_data_file(entry.get("path") or ""))
     result = _sniff_files(
         names, total,
-        lambda path: _github_peek(owner_repo, branch, path))
+        lambda path: _github_peek(owner_repo, branch, path),
+        lambda path: _github_parquet_peek(owner_repo, branch, path))
     result["branch"] = branch
     if tree.get("truncated"):
         result["detail"] += " (GitHub cut the file list short)"
@@ -563,6 +696,10 @@ def sniff_item(item: dict, token: str = "") -> dict:
     """Sniff one result or list item by its source and URL."""
     source = item.get("source") or ""
     url = item.get("url") or ""
+    if source not in ("Hugging Face", "GitHub"):
+        # A hand-added link (v0.1.4 T3): the source follows the
+        # URL, so a list saved before the fix still checks.
+        source = core.source_for_url(url)
     if source == "Hugging Face":
         dataset_id = ""
         if "/datasets/" in url:

@@ -145,7 +145,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
         "title": (args.title or "").strip() or url,
         "url": url,
         "category": args.category,
-        "source": "Found by hand",
+        "source": core.source_for_url(url),
         "stars": 0,
         "updated": "",
         "license": "",

@@ -40,6 +40,33 @@ class ScoreTests(unittest.TestCase):
         self.assertLess(result["score"], 25)
         self.assertEqual(result["label"], "Probably skip")
 
+    def test_unusable_dataset_never_reaches_top_bands(self):
+        # v0.1.4 T20: fresh, popular and licensed — but with no
+        # usable files the score stays below Promising.
+        for status in ("none", "unsupported", "no-fields"):
+            result = score.score_item(_item(
+                updated="2026-11-10T00:00:00Z",
+                stars=500, downloads=10000,
+                license="MIT", stella_status=status), now=NOW)
+            self.assertLessEqual(result["score"], 49,
+                                 f"status {status} scored "
+                                 f"{result['score']}")
+            self.assertNotIn(result["label"],
+                             ("Worth a look", "Promising"))
+
+    def test_unusable_shape_reason_says_so(self):
+        # v0.1.4 T20: the shape reason for an unusable dataset
+        # names the cap instead of "STELLA shape not checked
+        # yet".
+        for status, words in (
+                ("unsupported", "Cannot convert these files"),
+                ("no-fields", "no fields Scout can use")):
+            result = score.score_item(_item(stella_status=status),
+                                      now=NOW)
+            joined = " ".join(result["reasons"])
+            self.assertIn(words, joined)
+            self.assertIn("stays below Promising", joined)
+
     def test_reasons_name_each_part(self):
         result = score.score_item(_item(
             updated="2026-11-14T00:00:00Z",
@@ -96,6 +123,24 @@ class ScoreTests(unittest.TestCase):
         self.assertIn(f"Score {result['score']}", text)
         self.assertIn(result["label"], text)
         self.assertIn("MIT", text)
+
+
+class PluralizationTests(unittest.TestCase):
+    """v0.1.4 T38: "1 week ago", not "1 week(s) ago"."""
+
+    def test_singular_and_plural_forms(self):
+        cases = [
+            ("2026-11-08T00:00:00Z", "Updated 1 week ago"),
+            ("2026-11-01T00:00:00Z", "Updated 2 weeks ago"),
+            ("2026-10-16T00:00:00Z", "Updated 1 month ago"),
+            ("2026-09-16T00:00:00Z", "Updated 2 months ago"),
+            ("2025-11-15T00:00:00Z", "Updated 1 year ago"),
+            ("2024-11-15T00:00:00Z", "Updated 2 years ago"),
+        ]
+        for updated, expected in cases:
+            result = score.score_item(_item(updated=updated), now=NOW)
+            self.assertEqual(result["reasons"][0], expected)
+            self.assertNotIn("(s)", score.describe_score(result))
 
 
 if __name__ == "__main__":

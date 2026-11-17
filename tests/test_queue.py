@@ -130,6 +130,40 @@ class QueueStoreTests(unittest.TestCase):
         self.assertEqual(entries[0]["item"]["title"],
                          "https://example.com/a")
 
+    def test_retry_failed_requeues_failed_entries(self):
+        # v0.1.4 T45: failed entries go back to waiting, with the
+        # old error, outputs, and row count cleared.
+        entries, _added = queue.enqueue([], _item("https://example.com/a"))
+        entries, _added = queue.enqueue(entries, _item("https://example.com/b"))
+        entries, _added = queue.enqueue(entries, _item("https://example.com/c"))
+        entries[0]["state"] = queue.FAILED
+        entries[0]["error"] = "Download failed."
+        entries[0]["rows"] = 5
+        entries[0]["outputs"] = ["stale.jsonl"]
+        entries[1]["state"] = queue.DONE
+        count = queue.retry_failed(entries)
+        self.assertEqual(count, 1)
+        self.assertEqual(entries[0]["state"], queue.QUEUED)
+        self.assertEqual(entries[0]["error"], "")
+        self.assertEqual(entries[0]["rows"], 0)
+        self.assertEqual(entries[0]["outputs"], [])
+        self.assertEqual(entries[1]["state"], queue.DONE)
+        self.assertEqual(entries[2]["state"], queue.QUEUED)
+
+    def test_retry_failed_only_retries_the_picked_ids(self):
+        entries, _added = queue.enqueue([], _item("https://example.com/a"))
+        entries, _added = queue.enqueue(entries, _item("https://example.com/b"))
+        entries[0]["state"] = queue.FAILED
+        entries[1]["state"] = queue.FAILED
+        count = queue.retry_failed(entries, [entries[1]["id"]])
+        self.assertEqual(count, 1)
+        self.assertEqual(entries[0]["state"], queue.FAILED)
+        self.assertEqual(entries[1]["state"], queue.QUEUED)
+
+    def test_retry_failed_with_nothing_failed_retries_nothing(self):
+        entries, _added = queue.enqueue([], _item("https://example.com/a"))
+        self.assertEqual(queue.retry_failed(entries), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

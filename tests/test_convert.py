@@ -72,6 +72,46 @@ class MapRowTests(unittest.TestCase):
         self.assertEqual(row, {"prompt": "Translate: cat",
                                "completion": "chat"})
 
+    def test_prompt_response_maps(self):
+        # v0.1.4 T19: prompt + response is a common pair.
+        row, _reason = convert.map_row(
+            {"prompt": "Why?", "response": "Because."})
+        self.assertEqual(row, {"prompt": "Why?",
+                               "completion": "Because."})
+
+    def test_prompt_ground_truth_maps(self):
+        # v0.1.4 T19: question-answering files pair a prompt
+        # with a ground truth answer.
+        row, _reason = convert.map_row(
+            {"prompt": "2+2?", "ground_truth": "4"})
+        self.assertEqual(row, {"prompt": "2+2?",
+                               "completion": "4"})
+
+    def test_question_ground_truth_maps(self):
+        row, _reason = convert.map_row(
+            {"question": "2+2?", "ground_truth": "4"})
+        self.assertEqual(row, {"prompt": "2+2?",
+                               "completion": "4"})
+
+    def test_instruction_ground_truth_maps(self):
+        row, _reason = convert.map_row(
+            {"instruction": "Add.", "ground_truth": "4"})
+        self.assertEqual(row, {"prompt": "Add.",
+                               "completion": "4"})
+
+    def test_prompt_without_completion_says_what_is_missing(self):
+        # v0.1.4 T19: the prompt is present, so the reason says
+        # the completion is missing instead of calling the
+        # prompt empty.
+        row, reason = convert.map_row({"prompt": "a"})
+        self.assertIsNone(row)
+        self.assertIn("prompt has no completion", reason)
+
+    def test_completion_without_prompt_says_what_is_missing(self):
+        row, reason = convert.map_row({"completion": "b"})
+        self.assertIsNone(row)
+        self.assertIn("completion has no prompt", reason)
+
     def test_text_only_is_skipped_not_faked(self):
         # STELLA cannot train on a row with no prompt, so a bare
         # text row is skipped, never given an empty prompt.
@@ -192,7 +232,10 @@ class ConvertTextTests(unittest.TestCase):
     def test_json_single_object_without_rows_is_skipped(self):
         rows, report = convert.convert_json_text('{"prompt": "a"}')
         self.assertEqual(rows, [])
-        self.assertIn("prompt or completion is empty",
+        # v0.1.4 T19: the prompt is not empty, so the reason says
+        # what is actually missing instead of "prompt or
+        # completion is empty".
+        self.assertIn("prompt has no completion to pair it with",
                       report["skipped"])
 
     def test_json_scalar_is_not_an_object(self):
@@ -284,6 +327,26 @@ class RowsToJsonlTests(unittest.TestCase):
         self.assertEqual(back, rows)
 
 
+class ColumnsMapTests(unittest.TestCase):
+    # v0.1.4 T10: the Parquet peek judges columns by running a
+    # probe row through map_row, so the peek and the converter
+    # always agree.
+    def test_prompt_completion_columns_map(self):
+        self.assertTrue(convert.columns_map(["prompt", "completion"]))
+
+    def test_question_ground_truth_columns_map(self):
+        self.assertTrue(convert.columns_map(["question", "ground_truth"]))
+
+    def test_messages_column_maps(self):
+        self.assertTrue(convert.columns_map(["messages"]))
+
+    def test_text_only_columns_do_not_map(self):
+        self.assertFalse(convert.columns_map(["text"]))
+
+    def test_unrelated_columns_do_not_map(self):
+        self.assertFalse(convert.columns_map(["id", "url", "score"]))
+
+
 class PeekShapeTests(unittest.TestCase):
     def test_ready_jsonl(self):
         text = ('{"prompt": "a", "completion": "b"}\n'
@@ -300,9 +363,13 @@ class PeekShapeTests(unittest.TestCase):
         self.assertIn("with conversion", detail)
 
     def test_unknown_text_only(self):
+        # v0.1.4 T12: the file was read and its rows have no
+        # usable fields, so the peek says so instead of
+        # "unknown" (which means the check itself could not run).
         text = '{"text": "plain"}\n{"text": "plain"}\n'
-        status, _detail = convert.peek_shape(text)
-        self.assertEqual(status, "unknown")
+        status, detail = convert.peek_shape(text)
+        self.assertEqual(status, "unmappable")
+        self.assertIn("no fields Scout can map", detail)
 
     def test_empty_text_is_unknown(self):
         status, _detail = convert.peek_shape("")

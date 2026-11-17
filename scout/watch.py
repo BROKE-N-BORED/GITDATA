@@ -78,6 +78,10 @@ def _clean_watch(watch: dict) -> dict:
         "last_seen": [str(url) for url in seen
                       if isinstance(url, str)],
         "new": [item for item in new if isinstance(item, dict)],
+        # Whether the user has seen the new items (T42): old
+        # watches without the flag count as seen when they hold
+        # nothing new, and unseen when they do.
+        "new_seen": bool(watch.get("new_seen", not new)),
     }
 
 
@@ -97,6 +101,7 @@ def new_watch(query: str, category: str = "all",
         "last_run": "",
         "last_seen": [],
         "new": [],
+        "new_seen": True,
     }
 
 
@@ -167,6 +172,12 @@ def apply_watch_results(watch: dict, results: list[dict],
     run sets the baseline and reports nothing new. The watch's
     seen list and last-run time are updated either way, so a
     re-run never reports the same items twice.
+
+    New items are kept until the user has seen them (T42): a run
+    that finds nothing new must not wipe flags from an earlier
+    run, so the fresh items join the unseen ones instead of
+    replacing them. The dialog marks them seen when the user
+    picks the watch, and adding them to My List clears them.
     """
     now = now or datetime.now(timezone.utc)
     first_run = not watch.get("last_run")
@@ -192,6 +203,19 @@ def apply_watch_results(watch: dict, results: list[dict],
     watch["last_run"] = now.isoformat()
     if first_run:
         watch["new"] = []
+        watch["new_seen"] = True
         return []
-    watch["new"] = fresh[:MAX_NEW_ITEMS]
+    if fresh:
+        # Keep what the user has not seen yet, plus the fresh
+        # items, newest last, without duplicates.
+        kept = [item for item in watch.get("new") or []
+                if isinstance(item, dict)]
+        kept_urls = {core.normalize_url(item.get("url") or "")
+                     for item in kept}
+        for item in fresh:
+            if core.normalize_url(item.get("url") or "") not in kept_urls:
+                kept.append(item)
+                kept_urls.add(core.normalize_url(item.get("url") or ""))
+        watch["new"] = kept[-MAX_NEW_ITEMS:]
+        watch["new_seen"] = False
     return fresh
