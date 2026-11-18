@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from scout import apis, core
 from scout.gui import (
@@ -659,17 +659,53 @@ class DialogQueueTests(RedesignTestCase):
             self.assertTrue(warning.called)
             self.assertEqual(self.window._dialog_queue, [])
 
-    def test_update_check_uses_the_status_bar_not_a_popup(self):
-        with unittest.mock.patch.object(
-                QMessageBox, "information") as info:
+    def test_update_check_offers_a_popup_when_newer(self):
+        # v0.1.5 U2: a newer release shows the update popup
+        # (through the dialog queue, like other worker-completion
+        # dialogs), replacing the old status-bar-only message.
+        # The unreachable case still uses the status bar and
+        # never pops up. The click timer is armed BEFORE the
+        # check runs: the popup's exec() blocks, and without
+        # the timer the test would hang forever.
+        shown = []
+
+        def click_not_now():
+            for widget in QApplication.topLevelWidgets():
+                if isinstance(widget, QMessageBox) and widget.isVisible():
+                    for button in widget.buttons():
+                        if button.text() == "Not now":
+                            shown.append(widget)
+                            button.click()
+                            timer.stop()
+                            return
+
+        timer = QTimer()
+        timer.setInterval(25)
+        timer.timeout.connect(click_not_now)
+        timer.start()
+        try:
+            self.window.statusBar().clearMessage()
             self.window._update_check_done("v9.9.9")
-            self.assertFalse(info.called)
-        self.assertIn("Version v9.9.9 is out",
-                      self.window.statusBar().currentMessage())
+        finally:
+            timer.stop()
+        self.assertTrue(shown, "the update popup never showed")
+        box = shown[0]
+        self.assertEqual(box.windowTitle(), "A new version is out")
+        self.assertIn("v9.9.9", box.text())
+        self.assertEqual(
+            sorted(button.text() for button in box.buttons()),
+            ["Get it", "Not now"])
+        self.assertNotIn("Version v9.9.9 is out",
+                         self.window.statusBar().currentMessage())
         with unittest.mock.patch.object(
-                QMessageBox, "information") as info:
+                QMessageBox, "information") as info, \
+                unittest.mock.patch.object(
+                    MainWindow, "_offer_update") as offer:
             self.window._update_check_done(None)
             self.assertFalse(info.called)
+            offer.assert_not_called()
+        self.assertIn("Could not check",
+                      self.window.statusBar().currentMessage())
 
 
 class SourcesHeaderTests(RedesignTestCase):

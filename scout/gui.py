@@ -2489,6 +2489,11 @@ class MainWindow(QMainWindow):
         self.check_worker: LinkCheckWorker | None = None
         self.stella_worker: StellaCheckWorker | None = None
         self.update_worker: UpdateCheckWorker | None = None
+        # True while a running update check is the silent startup
+        # one (v0.1.5 U1): up to date or unreachable stays quiet.
+        # A manual check during a running silent one flips this
+        # off, so the in-flight answer still gets its receipt.
+        self._update_check_silent = False
         self.watch_worker: WatchWorker | None = None
         self._online_worker: OnlineCheckWorker | None = None
         # Online state (T67): None until the first check answers.
@@ -2813,34 +2818,78 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ update check (T21)
 
-    def check_for_updates(self):
+    def check_for_updates(self, silent: bool = False):
+        """Ask GitHub for the latest release, off the UI thread.
+
+        silent is the startup check (v0.1.5 U1): up to date or
+        unreachable stays quiet, and only a newer release speaks.
+        The manual Help-menu check keeps its status-bar receipt
+        for the up-to-date and unreachable cases.
+        """
         if self.update_worker is not None and self.update_worker.isRunning():
+            if not silent:
+                # A manual check during a running silent one
+                # upgrades it: the in-flight answer still gets
+                # its receipt instead of staying quiet.
+                self._update_check_silent = False
             return
-        if not self._require_online("Checking for updates"):
-            return
-        self.statusBar().showMessage("Checking for updates...")
+        if not silent:
+            if not self._require_online("Checking for updates"):
+                return
+            self.statusBar().showMessage("Checking for updates...")
+        self._update_check_silent = silent
         self.update_worker = UpdateCheckWorker(self)
         self.update_worker.finished.connect(self._update_check_done)
         self.update_worker.start()
 
     def _update_check_done(self, tag):
-        # The receipt goes to the status bar (T60, 003): the popup
-        # is reserved for the both-sources-failed search case.
         # The meter refreshes too: an update check reads the core
         # quota, and the meter must not show it as searches (T14).
         self._refresh_rate()
+        silent = self._update_check_silent
         if not tag:
-            self.statusBar().showMessage(
-                "Could not check for updates. Try again later.")
+            # Unreachable (v0.1.5 U1): the silent startup check
+            # stays quiet — the worker already logged the failure.
+            # The manual check keeps its status-bar receipt.
+            if not silent:
+                self.statusBar().showMessage(
+                    "Could not check for updates. Try again later.")
             return
         current = core.parse_version(core.VERSION)
         latest = core.parse_version(tag)
         if latest <= current:
-            self.statusBar().showMessage("Dataset Scout is up to date.")
+            if not silent:
+                self.statusBar().showMessage("Dataset Scout is up to date.")
         else:
-            self.statusBar().showMessage(
-                f"Version {tag} is out. You have {core.VERSION}. "
-                "Get it from the GITDATA releases page on GitHub.")
+            # A newer release (v0.1.5 U2): a popup asks whether
+            # to get it, on both the startup and manual paths.
+            self._offer_update(tag)
+
+    def _offer_update(self, tag):
+        """The update-found popup (v0.1.5 U2): plain words, two
+        buttons. "Get it" hands off to the updater; "Not now"
+        just dismisses, and the app asks again next launch."""
+        def show_popup():
+            box = QMessageBox(self)
+            box.setWindowTitle("A new version is out")
+            box.setText(
+                f"Dataset Scout {tag} is out. "
+                f"You have {core.VERSION}.\n\n"
+                "Want to get the new version now?")
+            get_button = box.addButton(
+                "Get it", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is get_button:
+                from scout import updater
+                updater.start_update(self, tag)
+
+        # A worker-completion dialog (T60, U18): it never stacks
+        # on an open modal, it waits its turn.
+        self._queue_modal_dialog(
+            show_popup,
+            "A new version is out. It will show once the open "
+            "dialog closes.")
 
     # ------------------------------------------------------------ status bar numbers
 
@@ -5649,9 +5698,15 @@ class MainWindow(QMainWindow):
 
     def start_background_checks(self):
         """Start the background work main() owns: the online probe,
-        then due watches. Called once, after the window shows."""
+        then due watches, plus the silent startup update check.
+        Called once, after the window shows."""
         self._check_online()
         self._watch_timer.start()
+        # Silent startup update check (v0.1.5 U1): off the UI
+        # thread, after the window shows, so launch is never
+        # blocked. Silent when up to date or unreachable; only
+        # a newer release speaks, with the popup (U2).
+        self.check_for_updates(silent=True)
 
     def _check_online(self):
         """Probe the internet in the background (T67)."""
@@ -6265,8 +6320,9 @@ def main() -> int:
     window = MainWindow()
     guard.start_server(window.bring_to_front)
     window.show()
-    # Background checks (T63, T67): the online probe, then due
-    # watches. Started here, not in the window's __init__, so
+    # Background checks (T63, T67, v0.1.5 U1): the online probe,
+    # then due watches, plus the silent startup update check.
+    # Started here, not in the window's __init__, so
     # constructing the window never touches the network.
     window.start_background_checks()
     return app.exec()

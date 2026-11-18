@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.5 (2026-11-18)
+
+Silent update check plus ask-first auto-update, per Joshua's standing order.
+
+- U1: The app silently checks GitHub for a newer release when it starts; up to date or unreachable means no popup and no noise, and the manual Help menu check keeps its status-bar receipt
+- U2: When a newer release is out, a popup asks whether to get it, instead of only naming the releases page in the status bar
+- U3: Getting an update downloads the release zip and its SHA-256 sidecar and verifies the hash before installing anything; a mismatch or a missing sidecar is refused and nothing changes
+- U4: Every Release carries a SHA-256 sidecar next to the zip (the zip name plus `.sha256`), one line with the hex hash, so the updater has something to verify against
+- U5: A verified update is applied with a crash-safe swap (old tree kept until the new one is in place, the installed Python environment carried over), and a failed apply leaves the old version runnable; saved list, settings, and logs are never touched
+- U6: After the pull, a popup asks whether to restart now or later; restart now applies the update and restarts into the new version, later leaves it staged and it finishes on the next start
+- U7: Regression tests cover the whole update path (silent when up to date, popup when newer, refusal on bad checksum or missing sidecar, restart now and later, user data untouched)
+- U8: Verified end to end on a real install layout, older version to newer, including the restart-later path and the offline case
+
 ## v0.1.4 (2026-11-17)
 
 All 65 items from the v0.1.3 user-experience review, in one release.

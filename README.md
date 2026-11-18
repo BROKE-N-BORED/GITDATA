@@ -32,6 +32,49 @@ To launch from a terminal instead:
 
 `bash run.sh`
 
+## Updates
+
+Dataset Scout checks GitHub for a newer release when it starts.
+When one is out, a popup asks whether to get it. Getting it
+downloads the release and checks it before installing anything:
+if the download cannot be verified, nothing changes. After the
+download, a popup asks whether to restart now or later. Restart
+now applies the update and restarts into the new version; later
+leaves it staged, and it finishes the next time Dataset Scout
+starts. Your saved list, settings, and logs in
+`~/.dataset-scout/` are never touched by an update.
+
+For the person shipping a release: every Release must carry two
+assets, the zip and its SHA-256 sidecar, side by side:
+
+- the zip, e.g. `dataset-scout-v0.1.5.zip`
+- the sidecar, e.g. `dataset-scout-v0.1.5.zip.sha256`
+
+The sidecar filename is always the zip name plus `.sha256`. Its
+contents are one line: the hex SHA-256 hash of the zip file,
+either on its own or in `sha256sum` style
+(`<hash>  <filename>`). The updater takes the first word on the
+line as the hash. A release without a sidecar, or with a sidecar
+that does not match the zip, is refused: the app will not
+install it.
+
+The updater downloads both files from the release's stable
+download address:
+
+`https://github.com/BROKE-N-BORED/GITDATA/releases/download/<tag>/<asset>`
+
+for example
+`https://github.com/BROKE-N-BORED/GITDATA/releases/download/v0.1.5/dataset-scout-v0.1.5.zip`
+and the same address with `.sha256` on the end for the sidecar.
+No API call is involved, so the download never touches the
+GitHub API rate limit.
+
+A downloaded update waits in `~/.dataset-scout/update/pending/`
+until it is applied. Applying it replaces the program folder
+with the new version, carrying the installed Python environment
+(`.venv`) over, since the release zip never ships one. If an
+apply fails, the old version stays in place and keeps working.
+
 ## How to use it
 
 **Search tab**: type a few words, pick a category (All,

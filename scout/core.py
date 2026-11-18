@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus, urlsplit, urlunsplit
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 APP_NAME = "Dataset Scout"
 

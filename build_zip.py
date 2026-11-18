@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build dataset-scout-v0.1.4.zip for verification / release.
+"""Build dataset-scout-v0.1.5.zip for verification / release.
 
 Correct exec bits via external_attr: 0o100755 for scripts, 0o100644
 for plain files. Bare 0o755 (no file-type bits) extracts fine under
@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ZIP_NAME = "dataset-scout-v0.1.4.zip"
+ZIP_NAME = "dataset-scout-v0.1.5.zip"
 
 SCRIPTS = {"install.sh", "run.sh", "scout-cli", "run_tests.sh", "build_zip.py",
            "Install Dataset Scout.desktop"}
