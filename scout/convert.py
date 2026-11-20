@@ -125,6 +125,21 @@ def map_row(obj: dict) -> tuple[dict | None, str]:
         return {"prompt": question, "completion": response}, ""
     if question and ground_truth:
         return {"prompt": question, "completion": ground_truth}, ""
+    # problem/answer and problem/solution are the canonical
+    # GSM8K/MATH layouts (v0.1.6 T8): "problem" is the prompt-side
+    # field, paired the same way question is. "solution" is the
+    # worked answer where "answer" is the short final one, so
+    # answer wins when both are present.
+    problem = _nonempty(obj.get("problem"))
+    solution = _nonempty(obj.get("solution"))
+    if problem and answer:
+        return {"prompt": problem, "completion": answer}, ""
+    if problem and solution:
+        return {"prompt": problem, "completion": solution}, ""
+    if problem and response:
+        return {"prompt": problem, "completion": response}, ""
+    if problem and ground_truth:
+        return {"prompt": problem, "completion": ground_truth}, ""
     prompt = _nonempty(obj.get("prompt"))
     if prompt and response:
         return {"prompt": prompt, "completion": response}, ""
@@ -228,7 +243,7 @@ def convert_json_text(text: str) -> tuple[list[dict], dict]:
 _CSV_KNOWN_FIELDS = frozenset({
     "prompt", "completion", "messages", "instruction", "input",
     "output", "answer", "response", "question", "ground_truth",
-    "text",
+    "problem", "solution", "text",
 })
 
 

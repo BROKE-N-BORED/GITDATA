@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.1.6 (2026-11-19)
+
+All 39 items from the v0.1.5 user-experience review, in one release.
+
+- T1: The Help now tells v0.1.4-or-older users plainly that this one update is a hand install, and the v0.1.5 U8 line in this changelog was corrected to name what was actually exercised
+- T2: The Sources "Add website" form honours its own validator: a bad address is blocked with the same message the Add-a-link dialog shows, and the form stays open to fix it
+- T3: How to Use "Check for updates" rewritten for the real flow: silent check at start, popup asks, checksum verified before install, restart now or later, Help menu check still reports in the status bar
+- T4: How to Use Parquet text fixed: the reader is installed with the app; a missing reader is named only as an error case
+- T5: The status bar no longer keeps the "update will show once the dialog closes" message after the queued update popup has been shown
+- T6: The main window's download finish line matches what actually converted: nothing converted says so with no checkmark, and a partial run names the dataset and row counts
+- T7: The queue log prints each stage once instead of repeating the same Downloading line for every progress tick
+- T8: The converter recognises the `problem` prompt field (with answer, solution, response, ground_truth), so GSM8K/MATH-style datasets sniff as convertible and convert
+- T9: Orphaned `.tmp-*` download folders inside stella-ready are cleaned up on launch, one plain log line per removal
+- T10: The Search table fits at the default 1100x700 with no horizontal scrollbar and no clipped Score column; the 1366x768 fit is unchanged
+- T11: Table columns rebalanced: Score is capped near its content width and Title (My List) and Description (Search) get the freed space
+- T12: Ctrl+F switches to the Search tab as well as focusing the search box
+- T13: The Edit menu's Undo items are disabled when there is nothing to undo, and an empty undo answers "Nothing to undo." in the status bar
+- T14: The debug log now records the main actions (My List save/remove/edit, website add/remove, token saved without ever logging the token, watch and queue events, Send to STELLA, update download/apply), so a copied debug report is worth pasting
+- T15: The self-test dialog's header wraps, so the full sentence shows at the dialog's own size
+- T16: The Search tab gives its space back to the results: 6 rows visible at 1100x700 and 8 at 1366x768, with no function removed
+- T17: A manual update check that ends in the update popup leaves a status-bar receipt after the popup closes
+- T18: Cancelling an update download says "Update cancelled. Nothing was changed."
+- T19: Update wording uses one version format everywhere, matching the About box (no "v" in the popup, restart prompt, or check receipts)
+- T20: The STELLA Replace success message names the dataset backup file, not only the project backup
+- T21: A watch's first run says it set the starting point and how many results it saved, and watch outcomes show in the main window's status bar
+- T22: Download skip lines lead with the real reason rows were skipped; the at-least-2-rows note comes after
+- T23: When filters hide search results, the results area names the filter doing the hiding and offers "Show them anyway" for that search; the Active-only 12-month default itself is unchanged
+- T24: Pressing Pause in the queue settles the row's state to Paused at once and stops its Downloading lines
+- T25: The terminal sentence is gone from How to Use, and the installer's success message no longer name-drops the command line
+- T26: Enter inside a text field of the Add Link and Edit dialogs no longer files the dialog half-finished; Esc still closes
+- T27: The download dialog header names no filesystem path and uses the right pronoun for one dataset or many
+- T28: The Sources websites table sizes to its rows (with a sane maximum) and the Address column gets the freed space
+- T29: The Add Link and Edit Category box defaults to a real category from the data, never "All"
+- T30: My List leads with "Download and convert" as the visual primary, and the Edit-and-convert and Export sections start collapsed on first view
+- T31: How to Use explains the View menu's Comfortable and Compact row spacing
+- T32: How to Use explains all four quality score bands with their ranges
+- T33: How to Use names the fourth STELLA-check status (files read, no usable fields found)
+- T34: Saved websites can be edited in Sources (Edit button or double-click), through the same address validation as adding
+- T35: Sources and Help say where a GitHub token comes from, with an "Open GitHub token page" button
+- T36: Keyboard tab switching: Ctrl+1/2/3 and Ctrl+Tab / Ctrl+Shift+Tab, listed in the shortcuts overlay
+- T37: Search results already in My List are marked "(In My List)" in the row
+- T38: The Download dialog has a destination folder picker, remembered between runs, used by single downloads and the queue
+- T39: My List has an "Open the converted folder" button
+
 ## v0.1.5 (2026-11-18)
 
 Silent update check plus ask-first auto-update, per Joshua's standing order.
@@ -11,7 +55,7 @@ Silent update check plus ask-first auto-update, per Joshua's standing order.
 - U5: A verified update is applied with a crash-safe swap (old tree kept until the new one is in place, the installed Python environment carried over), and a failed apply leaves the old version runnable; saved list, settings, and logs are never touched
 - U6: After the pull, a popup asks whether to restart now or later; restart now applies the update and restarts into the new version, later leaves it staged and it finishes on the next start
 - U7: Regression tests cover the whole update path (silent when up to date, popup when newer, refusal on bad checksum or missing sidecar, restart now and later, user data untouched)
-- U8: Verified end to end on a real install layout, older version to newer, including the restart-later path and the offline case
+- U8: Verified with the v0.1.5 updater code, run from a test harness with the version string lowered, against the live v0.1.5 Release: the update popup, the download, the checksum verify, and the restart now and restart later paths
 
 ## v0.1.4 (2026-11-17)
 

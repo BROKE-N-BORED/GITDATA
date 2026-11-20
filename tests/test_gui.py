@@ -283,6 +283,22 @@ class SourcesTabTests(GuiTestCase):
                 self.window.sources_table.cellWidget(row, 2), buttons
             )
 
+    def test_add_source_blocks_a_bad_address(self):
+        # v0.1.6 T2, mirroring the Add a link junk-input test: an
+        # address that fails the app's own check is refused, not
+        # added, the form stays as typed, and the inline message
+        # is the same one the Add a link dialog shows.
+        self.window.site_name.setText("Bad Site")
+        self.window.site_url.setText("not a link")
+        self.window.add_source()
+        self.assertEqual(self.window.sources_table.rowCount(), 2)
+        self.assertEqual(len(core.load_sources()), 2)
+        self.assertEqual(self.window.site_name.text(), "Bad Site")
+        self.assertEqual(self.window.site_url.text(), "not a link")
+        self.assertEqual(self.window.site_url_error.text(),
+                         "That does not look like a link. Check it.")
+        self.assertFalse(self.window.site_url_error.isHidden())
+
     def test_save_token_persists_and_never_leaks_to_report(self):
         self.window.token_field.setText("ghp_GUI_TOKEN_999")
         self.window.save_token()

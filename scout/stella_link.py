@@ -225,6 +225,7 @@ def link_dataset(jsonl_path: Path | str, profile: str, project: str,
     """
     result: dict = {"ok": False, "message": "", "project_dir": None,
                     "dataset_path": None, "backup": None,
+                    "dataset_backup": None,
                     "created_project": False}
     stella = _stella_home(home)
     if stella is None:
@@ -313,6 +314,7 @@ def link_dataset(jsonl_path: Path | str, profile: str, project: str,
                 return result
 
     backup_path = None
+    dataset_backup_path = None
     try:
         if existing is not None:
             backup_path = manifest_path.with_name(
@@ -360,6 +362,7 @@ def link_dataset(jsonl_path: Path | str, profile: str, project: str,
                 dataset_backup = dataset_path.with_name(
                     dataset_path.name + BACKUP_SUFFIX)
                 shutil.copyfile(dataset_path, dataset_backup)
+                dataset_backup_path = dataset_backup
                 if backup_path is None:
                     backup_path = dataset_backup
         if not dataset_path.is_file() or not same:
@@ -392,6 +395,8 @@ def link_dataset(jsonl_path: Path | str, profile: str, project: str,
     result["project_dir"] = str(project_dir)
     result["dataset_path"] = str(dataset_path)
     result["backup"] = str(backup_path) if backup_path else None
+    result["dataset_backup"] = (
+        str(dataset_backup_path) if dataset_backup_path else None)
     result["created_project"] = created
     word = "row" if rows == 1 else "rows"
     if created:
@@ -404,7 +409,20 @@ def link_dataset(jsonl_path: Path | str, profile: str, project: str,
             f"Added {rows} {word} of training data to the STELLA "
             f"project {project_slug!r} in profile {profile_slug!r}. "
             "Open STELLA to train on it.")
-    if backup_path is not None:
+    if dataset_backup_path is not None:
+        # Name the dataset backup (v0.1.6 T20): it holds the
+        # training data that was replaced, which is the file the
+        # user would go looking for. When the project record was
+        # backed up too, name both.
+        message += (
+            f" The dataset you replaced was backed up as "
+            f"{dataset_backup_path.name}.")
+        if backup_path is not None \
+                and backup_path != dataset_backup_path:
+            message += (
+                f" The old project file was backed up as "
+                f"{backup_path.name}.")
+    elif backup_path is not None:
         message += f" The old file was backed up as {backup_path.name}."
     result["message"] = message
     return result

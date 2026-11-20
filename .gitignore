@@ -8,3 +8,4 @@ config.json
 sources.json
 mylist.json
 logs/
+.pytest_cache/

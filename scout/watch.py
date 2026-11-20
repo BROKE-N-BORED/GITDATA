@@ -82,6 +82,12 @@ def _clean_watch(watch: dict) -> dict:
         # watches without the flag count as seen when they hold
         # nothing new, and unseen when they do.
         "new_seen": bool(watch.get("new_seen", not new)),
+        # The first run's starting point (v0.1.6 T21): how many
+        # results were saved as the baseline, and whether the
+        # last run was that first run, so the window can say it
+        # set the starting point instead of "nothing new".
+        "baseline_count": core._safe_int(watch.get("baseline_count") or 0),
+        "just_started": bool(watch.get("just_started", False)),
     }
 
 
@@ -102,6 +108,8 @@ def new_watch(query: str, category: str = "all",
         "last_seen": [],
         "new": [],
         "new_seen": True,
+        "baseline_count": 0,
+        "just_started": False,
     }
 
 
@@ -204,7 +212,10 @@ def apply_watch_results(watch: dict, results: list[dict],
     if first_run:
         watch["new"] = []
         watch["new_seen"] = True
+        watch["baseline_count"] = len(fresh_urls)
+        watch["just_started"] = True
         return []
+    watch["just_started"] = False
     if fresh:
         # Keep what the user has not seen yet, plus the fresh
         # items, newest last, without duplicates.

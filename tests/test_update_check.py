@@ -228,7 +228,10 @@ class UpdateCheckTestCase(unittest.TestCase):
         self.assertTrue(self._popup_clicked, "the popup never showed")
         box = self._popup_clicked[0]
         self.assertEqual(box.windowTitle(), "A new version is out")
-        self.assertIn("v9.9.9", box.text())
+        # One version format everywhere (v0.1.6 T19): no "v",
+        # matching the About box.
+        self.assertIn("9.9.9", box.text())
+        self.assertNotIn("v9.9.9", box.text())
         self.assertIn(core.VERSION, box.text())
         self.assertEqual(
             sorted(button.text() for button in box.buttons()),

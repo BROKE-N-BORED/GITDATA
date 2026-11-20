@@ -145,4 +145,3 @@ else
   echo "Dataset Scout is installed. Open it from the app menu (Dataset Scout)."
   echo "No terminal needed."
 fi
-echo "Command line is available too: scout search \"reasoning dataset\""

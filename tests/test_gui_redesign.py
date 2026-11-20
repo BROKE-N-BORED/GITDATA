@@ -276,8 +276,12 @@ class MyListSectionsTests(RedesignTestCase):
                         self.window.edit_section,
                         self.window.export_section):
             self.assertIsInstance(section, CollapsibleSection)
-            self.assertTrue(section.is_expanded())
-            self.assertFalse(section.content.isHidden())
+        # First view (v0.1.6 T30): Remove and check starts open;
+        # Edit and convert and Export start collapsed, so the
+        # tab does not open as 23 same-weight buttons.
+        self.assertTrue(self.window.remove_section.is_expanded())
+        self.assertFalse(self.window.edit_section.is_expanded())
+        self.assertFalse(self.window.export_section.is_expanded())
 
     def test_collapsing_hides_the_buttons(self):
         self.window.remove_section.set_expanded(False)
@@ -691,7 +695,9 @@ class DialogQueueTests(RedesignTestCase):
         self.assertTrue(shown, "the update popup never showed")
         box = shown[0]
         self.assertEqual(box.windowTitle(), "A new version is out")
-        self.assertIn("v9.9.9", box.text())
+        # One version format everywhere (v0.1.6 T19): no "v".
+        self.assertIn("9.9.9", box.text())
+        self.assertNotIn("v9.9.9", box.text())
         self.assertEqual(
             sorted(button.text() for button in box.buttons()),
             ["Get it", "Not now"])
@@ -957,9 +963,11 @@ class SectionMemoryTests(RedesignTestCase):
         self.assertTrue(second.remove_section.is_expanded())
 
     def test_sections_ship_expanded(self):
+        # First view (v0.1.6 T30): only Remove and check ships
+        # expanded; the other two start in their collapsed state.
         self.assertTrue(self.window.remove_section.is_expanded())
-        self.assertTrue(self.window.edit_section.is_expanded())
-        self.assertTrue(self.window.export_section.is_expanded())
+        self.assertFalse(self.window.edit_section.is_expanded())
+        self.assertFalse(self.window.export_section.is_expanded())
 
 
 class StellaCheckAllTests(RedesignTestCase):

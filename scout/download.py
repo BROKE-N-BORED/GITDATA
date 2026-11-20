@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -40,6 +41,33 @@ MAX_FILES_PER_ITEM = 20
 # a zip bomb must not fill the disk.
 MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_EXTRACTED_MEMBERS = 10000
+
+
+def cleanup_orphan_tmp_folders(out_dir=None) -> int:
+    """Remove `.tmp-*` work folders left in stella-ready (v0.1.6 T9).
+
+    A download that dies mid-run (crash, power cut, killed process)
+    leaves its hidden work folder behind: by construction it holds
+    an incomplete download, and real outputs never use the prefix,
+    so every `.tmp-*` folder found at startup is removed. One plain
+    log line per folder removed. Returns how many were removed.
+    """
+    folder = Path(out_dir) if out_dir is not None else (
+        core.home_dir() / "stella-ready")
+    if not folder.is_dir():
+        return 0
+    removed = 0
+    for child in sorted(folder.glob(".tmp-*")):
+        if not child.is_dir():
+            continue
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            continue
+        removed += 1
+        core.log("Removed an unfinished download folder left by an "
+                 f"interrupted download: {child.name}")
+    return removed
 
 
 def safe_name(text: str) -> str:
@@ -161,9 +189,19 @@ def _convert_file(path: Path, out_path: Path,
             return False, f"could not convert {shown}: {exc}", 0
     ok, problem = convert.validate_rows(rows)
     if not ok:
-        return False, (
-            f"skipped {shown}: {problem}. "
-            f"{convert.describe_report(report)}"), 0
+        skipped = report.get("skipped") or {}
+        if skipped:
+            # Lead with the real reason (v0.1.6 T22): the dominant
+            # skip reason first, the at-least-2-rows note after it.
+            # Leading with "only 0 usable row(s)" read as if the
+            # file were simply too small.
+            dominant = max(skipped, key=lambda key: skipped[key])
+            count = skipped[dominant]
+            word = "row" if count == 1 else "rows"
+            return False, (
+                f"skipped {shown}: {count} {word} skipped: "
+                f"{dominant}. {problem}."), 0
+        return False, f"skipped {shown}: {problem}.", 0
     try:
         # Atomic (v0.1.3 T21): a failed write leaves no partial
         # output behind, and a crash never leaves a half-written

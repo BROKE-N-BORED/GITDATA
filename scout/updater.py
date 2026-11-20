@@ -77,6 +77,13 @@ _MAX_APPLY_ATTEMPTS = 3
 
 _HASH_RE = re.compile(r"[0-9a-fA-F]{64}")
 
+def display_version(tag: str) -> str:
+    """A tag as the About box shows a version (v0.1.6 T19): no
+    leading "v", so every update surface says it the same way."""
+    text = str(tag or "")
+    return text[1:] if text.startswith("v") else text
+
+
 # Plain-words refusals. Every one ends on "nothing was changed",
 # because that is the fact the user needs.
 MSG_NOT_VERIFIED = (
@@ -277,6 +284,7 @@ def download_release(tag: str, base_url: str | None = None,
     is staged as the pending update and its path is returned."""
     zip_name = zip_asset_name(tag)
     sidecar_name = sidecar_asset_name(tag)
+    core.log(f"update: download started for {tag}")
     sidecar_text = _download_text(
         release_url(tag, sidecar_name, base_url), kind="sidecar")
     expected = parse_sidecar(sidecar_text)
@@ -578,7 +586,8 @@ def ask_restart(parent, tag: str) -> bool:
     box = QMessageBox(parent)
     box.setWindowTitle("Restart to finish the update")
     box.setText(
-        f"Dataset Scout {tag} is downloaded and ready.\n\n"
+        f"Dataset Scout {display_version(tag)} is downloaded and "
+        "ready.\n\n"
         "Restart now to use it?")
     restart_button = box.addButton(
         "Restart now", QMessageBox.ButtonRole.AcceptRole)
@@ -638,8 +647,15 @@ def start_update(parent, tag: str, base_url: str | None = None) -> bool:
     try:
         download_release(tag, base_url=base_url, progress=progress)
     except UpdateCancelled:
+        core.log(f"update: download of {tag} cancelled; "
+                 "nothing was changed.")
+        # A cancelled download says so (v0.1.6 T18): every other
+        # refusal path names that nothing was changed, and the
+        # cancel path was the one silent one.
+        _show_info(parent, "Update cancelled. Nothing was changed.")
         return False
     except UpdateError as exc:
+        core.log(f"update: download of {tag} refused: {exc}")
         _show_error(parent, str(exc))
         return False
     finally:

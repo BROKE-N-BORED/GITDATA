@@ -70,6 +70,36 @@ ROW_ROLE = Qt.ItemDataRole.UserRole + 1
 # the default, compact is the opt-in for scanning long lists.
 DENSITY_ROW_HEIGHTS = {"comfortable": 48, "compact": 32}
 
+# Score column cap (v0.1.6 T11): the widest score text is
+# "100 Worth a look"; anything wider is empty space taken from
+# Title and Description.
+SCORE_COLUMN_MAX = 132
+
+def _display_version(tag) -> str:
+    """A version as the About box shows it (v0.1.6 T19): no
+    leading "v", so the update popup, the restart prompt, and
+    the status bar all say it the same way."""
+    text = str(tag or "")
+    return text[1:] if text.startswith("v") else text
+
+
+def _download_dir() -> Path:
+    """Where downloads are saved (v0.1.6 T38): the folder the
+    user picked in the Download window, remembered in the
+    config, or the stella-ready folder under the Scout home."""
+    saved = core.load_config().get("download_dir")
+    if saved:
+        return Path(str(saved))
+    return core.home_dir() / "stella-ready"
+
+
+def _save_download_dir(path) -> None:
+    """Remember the download destination (v0.1.6 T38)."""
+    config = core.load_config()
+    config["download_dir"] = str(path)
+    core.save_config(config)
+
+
 LICENSE_CHOICES = ["", "MIT", "Apache-2.0", "BSD-2-Clause",
                    "BSD-3-Clause", "CC0-1.0", "CC-BY-4.0",
                    "CC-BY-SA-4.0", "GPL-3.0", "LGPL-3.0", "MPL-2.0",
@@ -408,11 +438,14 @@ class CollapsibleSection(QWidget):
     it collapsed.
     """
 
-    def __init__(self, title: str, parent=None, key: str | None = None):
+    def __init__(self, title: str, parent=None, key: str | None = None,
+                 default_expanded: bool = True):
         super().__init__(parent)
         self._title = title
         self._key = key
-        self._expanded = True
+        # A remembered choice always wins (T47); the default only
+        # shapes the first view (v0.1.6 T30).
+        self._expanded = bool(default_expanded)
         if key is not None:
             saved = core.load_config().get("sections") or {}
             if isinstance(saved, dict) and key in saved:
@@ -901,6 +934,16 @@ class QueueWorker(QThread):
 # An action of None means the key is built into the widget (or is
 # a mouse gesture): documented here, bound nowhere (T52).
 SHORTCUTS = [
+    ("Ctrl+1", "shows the Search tab", "window",
+     "_shortcut_tab_search"),
+    ("Ctrl+2", "shows the My List tab", "window",
+     "_shortcut_tab_list"),
+    ("Ctrl+3", "shows the Sources tab", "window",
+     "_shortcut_tab_sources"),
+    ("Ctrl+Tab", "shows the next tab", "window",
+     "_shortcut_tab_next"),
+    ("Ctrl+Shift+Tab", "shows the previous tab", "window",
+     "_shortcut_tab_prev"),
     ("Ctrl+F", "focuses the search box", "window",
      "_shortcut_focus_search"),
     ("Ctrl+E", "exports the STELLA manifest", "window",
@@ -918,6 +961,20 @@ SHORTCUTS = [
 
 def _shortcuts_help_text() -> str:
     return " ".join(f"{key} {desc}." for key, desc, _s, _a in SHORTCUTS)
+
+
+def _fill_category_combo(combo) -> None:
+    """Fill a Category combo from the data (v0.1.6 T29).
+
+    "All" is the search filter, not a category, so it is never
+    offered here: the choices are the real categories from
+    core.CATEGORIES, and the combo stays editable so a custom
+    category can still be typed. Categories are DATA: nothing
+    here hard-codes a category name."""
+    for key, (label, _suffix) in core.CATEGORIES.items():
+        if key == "all":
+            continue
+        combo.addItem(label, key)
 
 
 def _category_list_text() -> str:
@@ -982,16 +1039,20 @@ HOW_TO_USE_SECTIONS = [
      "everything, like Check links does. Scout looks at the files "
      "and says STELLA-ready when a .jsonl file is already in "
      "STELLA's shape, Needs conversion when the data needs work, or "
-     "No data files when there is nothing to use. It checks one "
+     "No data files when there is nothing to use. It can also say "
+     "No usable fields: the files were read, but no prompt and "
+     "answer pairing was found in them, so there is nothing Scout "
+     "can turn into training rows. It checks one "
      "dataset at a time, only when you ask."),
     ("Download and convert",
      "Select rows in My List and press Download and convert. Scout "
      "downloads the dataset files and turns them into .jsonl files "
      "in STELLA's shape, saved under your Dataset Scout folder in "
      "stella-ready. Rows it cannot map are skipped, and the report "
-     "says how many and why. Parquet files convert too when the "
-     "optional pyarrow reader is installed; without it, the report "
-     "says the reader is missing."),
+     "says how many and why. Parquet files convert too: the reader "
+     "is installed with the app. If the reader is somehow missing, "
+     "the report says so as an error and tells you to run the "
+     "installer again to add it."),
     ("Download history",
      "Download history in the File menu lists what was converted, "
      "when, and how many rows, newest first. Pick an entry to open "
@@ -1026,7 +1087,9 @@ HOW_TO_USE_SECTIONS = [
      "Each result has a score from 0 to 100, from how recently it "
      "was updated, how many stars and downloads it has, whether "
      "its license is clear, and whether its shape fits STELLA. "
-     "Worth a look means 80 or more; Probably skip means under 25. "
+     "The bands are: Worth a look means 80 or more, Promising "
+     "means 50 to 79, Maybe means 25 to 49, and Probably skip "
+     "means under 25. "
      "It is a guide, not a verdict."),
     ("Offline",
      "With no network, Scout says so at the top of the Search tab. "
@@ -1034,19 +1097,37 @@ HOW_TO_USE_SECTIONS = [
      "the queue, and convert files already on your PC. Search, "
      "link checks, and downloads wait until you are back online."),
     ("GitHub token",
-     "GitHub allows more searches per minute with a token. Paste one in "
+     "GitHub allows more searches per minute with a token. You make "
+     "one on GitHub: open the GitHub token page with the button next "
+     "to the token field in the Sources tab, sign in, and create a "
+     "token there. Paste it in "
      "the Sources tab and press Save token. It is stored on this PC "
      "only and never written to a log. The status bar shows how many "
      "GitHub searches are left."),
+    ("Row spacing",
+     "The View menu has Comfortable rows and Compact rows. "
+     "Comfortable rows are roomy and easy to read. Compact rows "
+     "are tighter, so more rows fit on screen at once: use "
+     "Compact on a small window or with a long list."),
     ("Keyboard shortcuts", _shortcuts_help_text()),
     ("Check for updates",
-     "Check for updates in the Help menu looks at the GitHub "
-     "releases and says whether a newer version is out."),
+     "Dataset Scout checks for a new version on its own when it "
+     "starts, and says nothing when you are up to date. When a new "
+     "version is out, a popup asks whether to get it. The download "
+     "is checked against the checksum from the release before "
+     "anything installs. After the download, a second popup asks "
+     "restart now to complete the update, yes or no. Restart now "
+     "restarts Dataset Scout into the new version. Later is safe: "
+     "the update finishes the next time Dataset Scout starts. You "
+     "can also pick Check for updates in the Help menu at any time; "
+     "that check reports in the status bar. If you are on v0.1.4 or "
+     "older, this update is a one-time hand install: download the "
+     "zip and run the installer, like the first install. After "
+     "that, Dataset Scout updates itself from inside the app."),
     ("Self-test",
      "Run self-test in the Help menu checks the app end to end: "
      "search, sniff, and a sample conversion. It prints pass or fail "
-     "in plain words. scout-cli --self-test runs the same checks "
-     "from a terminal."),
+     "in plain words."),
     ("Debug report",
      "Copy debug report in the Sources tab copies the recent log to "
      "the clipboard, with any token removed, so you can share it when "
@@ -1166,8 +1247,11 @@ class AddLinkDialog(QDialog):
         layout.addRow("Title:", self.found_title)
         self.found_category = QComboBox()
         self.found_category.setEditable(True)
-        for key, (label, _suffix) in core.CATEGORIES.items():
-            self.found_category.addItem(label, key)
+        _fill_category_combo(self.found_category)
+        # The default is a real category from the data (T29),
+        # never "All": the first real category in the list.
+        if self.found_category.count():
+            self.found_category.setCurrentIndex(0)
         layout.addRow("Category:", self.found_category)
         layout.addRow("", _explain(
             "Pick one, or type your own category."))
@@ -1179,12 +1263,31 @@ class AddLinkDialog(QDialog):
         add_button = buttons.addButton(
             "Add link", QDialogButtonBox.ButtonRole.AcceptRole)
         add_button.setToolTip("Add this link to My List.")
+        # Enter stays in its field (v0.1.6 T26): no button is the
+        # dialog default, so pressing Enter in a text field does
+        # not file the link half-finished. The buttons still work
+        # by click, and Esc still closes.
+        add_button.setAutoDefault(False)
+        add_button.setDefault(False)
         cancel_button = buttons.addButton(
             "Cancel", QDialogButtonBox.ButtonRole.RejectRole)
         cancel_button.setToolTip("Close without adding anything.")
+        cancel_button.setAutoDefault(False)
+        cancel_button.setDefault(False)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addRow("", buttons)
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        # Enter stays in its field (v0.1.6 T26): while a text
+        # field has focus, Return and Enter do nothing, so a
+        # half-finished link is never filed by habit. Esc still
+        # closes through the normal dialog handling.
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
+                and isinstance(self.focusWidget(), QLineEdit):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _validate_url(self, force: bool = False) -> bool:
         """Inline validation (044): on blur, beside the field.
@@ -1254,8 +1357,7 @@ class EditItemDialog(QDialog):
         layout.addRow("", _explain("The name shown in My List."))
         self.category_field = QComboBox()
         self.category_field.setEditable(True)
-        for key, (label, _suffix) in core.CATEGORIES.items():
-            self.category_field.addItem(label, key)
+        _fill_category_combo(self.category_field)
         current = core.category_label(self._original_category)
         self.category_field.setCurrentText(current)
         layout.addRow("Category:", self.category_field)
@@ -1285,12 +1387,27 @@ class EditItemDialog(QDialog):
         save_button = buttons.addButton(
             "Save changes", QDialogButtonBox.ButtonRole.AcceptRole)
         save_button.setToolTip("Save the changes to this link.")
+        # Enter stays in its field (v0.1.6 T26), as in the Add
+        # dialog: no default button, Esc still closes.
+        save_button.setAutoDefault(False)
+        save_button.setDefault(False)
         cancel_button = buttons.addButton(
             "Cancel", QDialogButtonBox.ButtonRole.RejectRole)
         cancel_button.setToolTip("Close without saving anything.")
+        cancel_button.setAutoDefault(False)
+        cancel_button.setDefault(False)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addRow("", buttons)
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        # Enter stays in its field (v0.1.6 T26), as in the Add
+        # dialog.
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
+                and isinstance(self.focusWidget(), QLineEdit):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _validate_url(self, force: bool = False) -> bool:
         """Inline validation, the same check as the add form (044).
@@ -1385,12 +1502,37 @@ class DownloadDialog(QDialog):
         self._outputs_by_index: dict[int, list] = {}
 
         layout = QVBoxLayout(self)
-        word = "dataset" if len(items) == 1 else "datasets"
-        header = QLabel(
-            f"Downloading {len(items)} {word} and converting them "
-            f"to STELLA .jsonl files in {out_dir}.")
-        header.setWordWrap(True)
-        layout.addWidget(header)
+        # No raw path, right pronoun (v0.1.6 T27): one dataset is
+        # "it", several are "them", and the place is named the way
+        # the rest of the app names it.
+        if len(items) == 1:
+            header_text = (
+                "Downloading 1 dataset and converting it to STELLA "
+                ".jsonl files in your Dataset Scout folder.")
+        else:
+            header_text = (
+                f"Downloading {len(items)} datasets and converting "
+                "them to STELLA .jsonl files in your Dataset Scout "
+                "folder.")
+        self.header_label = QLabel(header_text)
+        self.header_label.setWordWrap(True)
+        layout.addWidget(self.header_label)
+        # The destination picker (v0.1.6 T38): where the converted
+        # files go. Remembered between runs; the queue uses the
+        # same remembered folder. Picking a folder mid-run sends
+        # the datasets that have not started yet to the new place.
+        dest_row = QHBoxLayout()
+        dest_row.addWidget(QLabel("Saving to:"))
+        self.dest_label = QLabel(str(self.out_dir))
+        self.dest_label.setToolTip(
+            "The folder the converted files are saved in.")
+        dest_row.addWidget(self.dest_label, stretch=1)
+        self.choose_folder_button = QPushButton("Choose folder")
+        self.choose_folder_button.setToolTip(
+            "Save the converted files in a different folder.")
+        self.choose_folder_button.clicked.connect(self._choose_folder)
+        dest_row.addWidget(self.choose_folder_button)
+        layout.addLayout(dest_row)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         layout.addWidget(self.log_view, stretch=1)
@@ -1440,8 +1582,27 @@ class DownloadDialog(QDialog):
             self.stop_button.setEnabled(False)
             self._log("Stopping...")
 
+    def _choose_folder(self):
+        """Pick the destination folder (v0.1.6 T38)."""
+        picked = QFileDialog.getExistingDirectory(
+            self, "Choose where converted files go",
+            str(self.out_dir))
+        if not picked:
+            return
+        self.out_dir = Path(picked)
+        _save_download_dir(self.out_dir)
+        self.dest_label.setText(str(self.out_dir))
+        if self.worker is not None and self.worker.isRunning():
+            # Datasets that have not started yet go to the new
+            # folder; the one running now finishes where it began.
+            self.worker.out_dir = self.out_dir
+            self._log(
+                f"Saving the rest to {self.out_dir}.")
+        else:
+            self._log(f"Saving to {self.out_dir}.")
+
     def open_folder(self):
-        QDesktopServices.openUrl(str(self.out_dir))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.out_dir)))
 
     def closeEvent(self, event):  # noqa: N802 - Qt naming
         if self.worker is not None and self.worker.isRunning():
@@ -1692,7 +1853,15 @@ class WatchDialog(QDialog):
         new_items = picked.get("new") or []
         last = picked.get("last_run") or ""
         when = core.format_date(last) if last else "never"
-        if new_items:
+        if picked.get("just_started") and not new_items:
+            # The first run set the starting point (v0.1.6 T21):
+            # say so, instead of claiming nothing was new since a
+            # last run that never happened.
+            count = picked.get("baseline_count") or 0
+            self.new_label.setText(
+                f"Watch started: {count} results saved as the "
+                "starting point. New ones will show here.")
+        elif new_items:
             word = "dataset" if len(new_items) == 1 else "datasets"
             self.new_label.setText(
                 f"{len(new_items)} new {word} since the last run "
@@ -1743,6 +1912,8 @@ class WatchDialog(QDialog):
             return
         picked["enabled"] = not picked.get("enabled", True)
         watch.save_watches(self.watches)
+        core.log(f"Watch {'resumed' if picked['enabled'] else 'paused'}: "
+                 f"{picked.get('query')!r}.")
         self.refresh()
 
     def _remove_watch(self):
@@ -1765,6 +1936,7 @@ class WatchDialog(QDialog):
             return
         watch.save_watches(
             watch.remove_watch(self.watches, picked["id"]))
+        core.log(f"Watch deleted: {picked.get('query')!r}.")
         self.refresh()
 
 
@@ -1776,9 +1948,18 @@ class QueueDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Download queue")
         self.setMinimumSize(650, 450)
-        self.out_dir = core.home_dir() / "stella-ready"
+        # The remembered download destination (v0.1.6 T38): the
+        # same folder the Download window saves to.
+        self.out_dir = _download_dir()
         self.worker: QueueWorker | None = None
+        # Set when Pause is pressed (v0.1.6 T24): the row settles
+        # at once and no more stage lines print for that item.
+        self._pause_requested = False
         self.entries: list[dict] = []
+        # The last stage line logged (v0.1.6 T7): progress chunks
+        # repeat the same stage, and the log shows it once, like
+        # the single Download window already does.
+        self._last_stage = ""
         layout = QVBoxLayout(self)
         intro = QLabel(
             "Queued datasets download and convert one at a time. "
@@ -1939,6 +2120,9 @@ class QueueDialog(QDialog):
             return
         self.start_button.setEnabled(False)
         self.pause_button.setEnabled(True)
+        self._pause_requested = False
+        self.out_dir = _download_dir()
+        core.log(f"Download queue started: {len(queued)} waiting.")
         self.worker = QueueWorker(queued, self.out_dir,
                                   token=core.get_github_token(),
                                   parent=self)
@@ -1952,6 +2136,16 @@ class QueueDialog(QDialog):
         if self.worker is not None and self.worker.isRunning():
             self.worker.request_stop()
             self.pause_button.setEnabled(False)
+            self._pause_requested = True
+            # Settle the row in the same beat (v0.1.6 T24): the
+            # running row reads Paused now, not Downloading until
+            # the worker's done signal lands. The saved entry
+            # follows when the run reports it stopped.
+            for row, entry in enumerate(self.entries):
+                if entry["state"] == dlqueue.RUNNING:
+                    cell = self.queue_table.item(row, 1)
+                    if cell is not None:
+                        cell.setText("Paused")
             self._log("Pausing the download now...")
 
     def closeEvent(self, event):  # noqa: N802 - Qt naming
@@ -1962,12 +2156,23 @@ class QueueDialog(QDialog):
 
     def _on_progress(self, _entry_id: str, stage: str,
                      got: int, total: int):
+        if self._pause_requested:
+            # Paused (v0.1.6 T24): no more Downloading lines for
+            # this item once Pause has landed.
+            return
         if total and total > 0:
             self.bar.setMaximum(100)
             self.bar.setValue(min(100, int(got * 100 / total)))
         else:
             self.bar.setMaximum(0)
-        self._log(stage)
+        # Log each stage once, not once per chunk (v0.1.6 T7):
+        # one 17 MB download used to print the same Downloading
+        # line 126 times, burying the lines that matter. Real
+        # events (started, done, failures, the summary) go through
+        # their own handlers and always print.
+        if stage != self._last_stage:
+            self._last_stage = stage
+            self._log(stage)
 
     def _on_entry_started(self, entry_id: str):
         entry = self._entry(entry_id)
@@ -1975,6 +2180,9 @@ class QueueDialog(QDialog):
             entry["state"] = dlqueue.RUNNING
             dlqueue.save_queue(self.entries)
             self.refresh()
+        # A new entry's first stage prints even when its text
+        # matches the previous entry's last stage (T7).
+        self._last_stage = ""
 
     def _on_entry_done(self, entry_id: str, ok: bool, message: str,
                        outputs: list, rows: int, state: str):
@@ -2050,10 +2258,14 @@ class QueueDialog(QDialog):
         self._refresh_buttons()
         if stopped:
             self._log("Paused. Start resumes the queue.")
+            core.log("Download queue paused.")
         else:
             self._log(f"Queue done: {total['done']} done, "
                       f"{total['failed']} failed, "
                       f"{total['queued']} still waiting.")
+            core.log(f"Download queue finished: {total['done']} done, "
+                     f"{total['failed']} failed, "
+                     f"{total['queued']} still waiting.")
 
     def _remove_selected(self):
         rows = {index.row() for index in
@@ -2321,9 +2533,15 @@ class SelfTestDialog(QDialog):
         self.setMinimumSize(560, 320)
         self.worker: SelfTestWorker | None = None
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
+        # Word wrap on the header (v0.1.6 T15): at the dialog's
+        # own 560 px default the sentence was cut mid-word. It is
+        # the dialog's only long label; the report below is a text
+        # view, which wraps on its own.
+        self.header_label = QLabel(
             "The self-test checks search, sniff, and conversion end "
-            "to end. It takes a few seconds and changes nothing."))
+            "to end. It takes a few seconds and changes nothing.")
+        self.header_label.setWordWrap(True)
+        layout.addWidget(self.header_label)
         self.report_view = QTextEdit()
         self.report_view.setReadOnly(True)
         layout.addWidget(self.report_view, stretch=1)
@@ -2536,6 +2754,14 @@ class MainWindow(QMainWindow):
         # usual text (v0.1.4 T18/T29): a failed or offline search
         # says so, instead of showing the never-searched hint.
         self._results_empty_note = ""
+        # The last search's unfiltered results and how many each
+        # filter hid (v0.1.6 T23): "Show them anyway" re-filters
+        # these in place, with no new search.
+        self._last_raw_results: list[dict] = []
+        self._hidden_breakdown: dict = {}
+        # Whether the update popup on screen came from a manual
+        # check (v0.1.6 T17): a manual check leaves a receipt.
+        self._update_offer_manual = False
         # The checklist's completion beat (T36) starts as shown:
         # a returning user whose setup is already done must not
         # see the list flash on every launch. It clears the first
@@ -2567,6 +2793,7 @@ class MainWindow(QMainWindow):
         self._build_search_tab()
         self._build_list_tab()
         self._build_sources_tab()
+        self.tabs.currentChanged.connect(self._refit_tables)
         self._refresh_list_tab()
         self._refresh_site_buttons()
         self._build_shortcuts()
@@ -2633,6 +2860,20 @@ class MainWindow(QMainWindow):
         self.health_takeaway.setVisible(width >= 1300)
         self.health_bar.setVisible(width >= 1200)
 
+    def _refit_tables(self, _index: int = -1):
+        """Re-fit both tables' columns to the real viewport
+        (v0.1.6 T10/T11): the construction-time fit sees
+        provisional geometry, so showing the window and switching
+        tabs fit again with true sizes."""
+        if hasattr(self, "results_table") and self.results:
+            self._fit_results_columns()
+        if hasattr(self, "list_table"):
+            self._fit_list_columns()
+
+    def showEvent(self, event):  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        self._refit_tables()
+
     def resizeEvent(self, event):  # noqa: N802 - Qt naming
         super().resizeEvent(event)
         self._layout_status_bar()
@@ -2640,6 +2881,8 @@ class MainWindow(QMainWindow):
         # the fit from the last search assumed the old width.
         if hasattr(self, "results_table") and self.results:
             self._fit_results_columns()
+        if hasattr(self, "list_table") and self.my_list:
+            self._fit_list_columns()
 
     # ------------------------------------------------------------ menus (T23, U38)
 
@@ -2699,12 +2942,17 @@ class MainWindow(QMainWindow):
             file_menu, "Exit", self.close, "Close Dataset Scout.")
 
         edit_menu = self.menuBar().addMenu("Edit")
-        self._menu_action(
+        # The Undo items track the same enable state as the My
+        # List tab buttons (v0.1.6 T13): disabled while their
+        # stack is empty. _sync_undo_actions keeps them in step.
+        self.undo_remove_action = self._menu_action(
             edit_menu, "Undo remove", self.undo_remove,
             "Bring back the rows removed most recently.")
-        self._menu_action(
+        self.undo_remove_action.setEnabled(False)
+        self.undo_edit_action = self._menu_action(
             edit_menu, "Undo edit", self.undo_edit,
             "Undo the last change made in the Edit window.")
+        self.undo_edit_action.setEnabled(False)
         self._menu_action(
             edit_menu, "Remove selected", self.remove_selected,
             "Remove the picked rows from My List. Delete does this too.",
@@ -2786,7 +3034,32 @@ class MainWindow(QMainWindow):
         ShortcutsDialog(self).exec()
 
     def _shortcut_focus_search(self):
+        # Show the box as well as focus it (v0.1.6 T12): from
+        # another tab, focusing an invisible field left the user
+        # typing into a hidden box with no visible change.
+        self.tabs.setCurrentIndex(0)
         self.search_box.setFocus()
+
+    def _shortcut_tab_search(self):
+        self.tabs.setCurrentIndex(0)
+
+    def _shortcut_tab_list(self):
+        self.tabs.setCurrentIndex(1)
+
+    def _shortcut_tab_sources(self):
+        self.tabs.setCurrentIndex(2)
+
+    def _shortcut_tab_next(self):
+        count = self.tabs.count()
+        if count:
+            self.tabs.setCurrentIndex(
+                (self.tabs.currentIndex() + 1) % count)
+
+    def _shortcut_tab_prev(self):
+        count = self.tabs.count()
+        if count:
+            self.tabs.setCurrentIndex(
+                (self.tabs.currentIndex() - 1) % count)
 
     def _shortcut_export_stella(self):
         self.export_list("stella")
@@ -2863,26 +3136,39 @@ class MainWindow(QMainWindow):
         else:
             # A newer release (v0.1.5 U2): a popup asks whether
             # to get it, on both the startup and manual paths.
+            self._update_offer_manual = not silent
             self._offer_update(tag)
 
     def _offer_update(self, tag):
         """The update-found popup (v0.1.5 U2): plain words, two
         buttons. "Get it" hands off to the updater; "Not now"
         just dismisses, and the app asks again next launch."""
+        manual = self._update_offer_manual
+
         def show_popup():
             box = QMessageBox(self)
             box.setWindowTitle("A new version is out")
             box.setText(
-                f"Dataset Scout {tag} is out. "
-                f"You have {core.VERSION}.\n\n"
+                f"Dataset Scout {_display_version(tag)} is out. "
+                f"You have {_display_version(core.VERSION)}.\n\n"
                 "Want to get the new version now?")
             get_button = box.addButton(
                 "Get it", QMessageBox.ButtonRole.AcceptRole)
             box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
             box.exec()
+            if manual:
+                # A manual check leaves a receipt (v0.1.6 T17):
+                # "Checking for updates..." must not be left
+                # standing after the popup is dismissed.
+                self.statusBar().showMessage(
+                    f"Dataset Scout {_display_version(tag)} is out.")
             if box.clickedButton() is get_button:
                 from scout import updater
                 updater.start_update(self, tag)
+                if manual:
+                    self.statusBar().showMessage(
+                        f"Dataset Scout {_display_version(tag)} "
+                        "is out.")
 
         # A worker-completion dialog (T60, U18): it never stacks
         # on an open modal, it waits its turn.
@@ -3138,12 +3424,27 @@ class MainWindow(QMainWindow):
         if hasattr(self, "undo_edit_button"):
             self.undo_edit_button.setEnabled(
                 (not locked) and bool(self._edit_undo_stack))
+        self._sync_undo_actions()
         if hasattr(self, "remove_dead_button"):
             self._refresh_dead_button()
         searching = (self.search_worker is not None
                      and self.search_worker.isRunning())
         self.search_button.setEnabled(not locked and not searching)
         self.list_table.setDragEnabled(not locked)
+
+    def _sync_undo_actions(self):
+        """Keep the Edit menu's Undo items in step with the My
+        List tab buttons (v0.1.6 T13): the menu copies the
+        buttons' enabled state, which the stacks and the check
+        lock already compute."""
+        if hasattr(self, "undo_remove_action") \
+                and hasattr(self, "undo_button"):
+            self.undo_remove_action.setEnabled(
+                self.undo_button.isEnabled())
+        if hasattr(self, "undo_edit_action") \
+                and hasattr(self, "undo_edit_button"):
+            self.undo_edit_action.setEnabled(
+                self.undo_edit_button.isEnabled())
 
     def _find_list_index(self, url: str) -> int:
         """The index of a list item by URL, or -1 when it is gone."""
@@ -3212,7 +3513,18 @@ class MainWindow(QMainWindow):
         if not self._any_modal_open():
             show_fn()
             return
-        self._dialog_queue.append(show_fn)
+
+        def show_then_clear():
+            show_fn()
+            # The waiting message described this dialog (v0.1.6
+            # T5): once the dialog has been shown and dismissed,
+            # the message must not stand there saying a dialog is
+            # still coming. Clear it only when it is still the
+            # current message, so a newer message is never eaten.
+            if self.statusBar().currentMessage() == waiting_message:
+                self.statusBar().clearMessage()
+
+        self._dialog_queue.append(show_then_clear)
         self.statusBar().showMessage(waiting_message)
         if not self._dialog_queue_timer.isActive():
             self._dialog_queue_timer.start()
@@ -3252,7 +3564,10 @@ class MainWindow(QMainWindow):
         height = DENSITY_ROW_HEIGHTS[self._density()]
         for table in (self.results_table, self.list_table):
             table.verticalHeader().setDefaultSectionSize(height)
-            table.horizontalHeader().setMinimumHeight(height)
+            # The header needs less height than a data row
+            # (v0.1.6 T16): at the row height it ate a full row's
+            # worth of the results table's viewport.
+            table.horizontalHeader().setMinimumHeight(30)
             for row in range(table.rowCount()):
                 table.setRowHeight(row, height)
         self._sync_density_menu()
@@ -3352,10 +3667,9 @@ class MainWindow(QMainWindow):
 
         heading = _heading("Dataset finder for STELLA")
         layout.addWidget(heading)
-        layout.addWidget(QLabel(
-            "Find training datasets, save the links, check them, "
-            "convert them for STELLA."
-        ))
+        # No separate subtitle line (v0.1.6 T16): what the tab is
+        # for is said by the heading and the How to Use guide, and
+        # the line's height belongs to the results table.
 
         # The offline note (T67): shown only when the internet
         # cannot be reached, so offline work stays honest.
@@ -3429,11 +3743,25 @@ class MainWindow(QMainWindow):
         # the search says how long it has been going.
         self.search_elapsed_label = QLabel("")
         row.addWidget(self.search_elapsed_label)
+        # Find in these results shares the search row (v0.1.6
+        # T16): it had a row of its own under the table's chrome,
+        # and the results table paid for it. It still narrows the
+        # on-screen rows by title, description, or source (T55)
+        # with no new search.
+        row.addWidget(QLabel("Find in these results:"))
+        self.results_filter_box = QLineEdit()
+        self.results_filter_box.setPlaceholderText(
+            "Type to filter by title, description, or source")
+        self.results_filter_box.setToolTip(
+            "Type a few letters to keep only matching results.")
+        self.results_filter_box.textChanged.connect(
+            self._apply_results_filter)
+        row.addWidget(self.results_filter_box, stretch=1)
         layout.addLayout(row)
-        layout.addWidget(_explain(
-            "Searches GitHub and Hugging Face live. Results come "
-            "back newest first. Recent searches are kept in the "
-            "search box drop-down."))
+        # The two explainer lines that used to sit under the
+        # search row and the filter row are folded into the
+        # Details pane's resting text (v0.1.6 T16): the words stay
+        # on the tab, the stacked lines do not.
 
         chip_row = QHBoxLayout()
         chip_row.addWidget(QLabel("Category:"))
@@ -3493,30 +3821,29 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(self.license_combo)
         filter_row.addStretch(1)
         layout.addLayout(filter_row)
-        layout.addWidget(_explain(
-            "Active only keeps results updated recently. Stars counts "
-            "GitHub stars and Hugging Face likes. A license filter "
-            "hides results with no license shown."))
 
         self.results_empty_label = QLabel(
             "No results yet. Type a few words and press Search.")
         self.results_empty_label.setStyleSheet("color: #9fb0cc;")
         layout.addWidget(self.results_empty_label)
 
-        # Find in these results (T55): narrowing 60 rows by a word
-        # costs no new search and no GitHub quota, like My List's
-        # "Find in this list".
-        results_filter_row = QHBoxLayout()
-        results_filter_row.addWidget(QLabel("Find in these results:"))
-        self.results_filter_box = QLineEdit()
-        self.results_filter_box.setPlaceholderText(
-            "Type to filter by title, description, or source")
-        self.results_filter_box.setToolTip(
-            "Type a few letters to keep only matching results.")
-        self.results_filter_box.textChanged.connect(
-            self._apply_results_filter)
-        results_filter_row.addWidget(self.results_filter_box, stretch=1)
-        layout.addLayout(results_filter_row)
+        # Which filter hid results, and the way back (v0.1.6
+        # T23): shown only when a search hid something. The
+        # button relaxes the hiding filter for this search only;
+        # the saved default does not change.
+        hidden_row = QHBoxLayout()
+        self.filter_hidden_label = QLabel("")
+        self.filter_hidden_label.setWordWrap(True)
+        self.filter_hidden_label.setVisible(False)
+        hidden_row.addWidget(self.filter_hidden_label, stretch=1)
+        self.show_hidden_button = QPushButton("Show them anyway")
+        self.show_hidden_button.setToolTip(
+            "Show the hidden results for this search. Your saved "
+            "filter choices do not change.")
+        self.show_hidden_button.setVisible(False)
+        self.show_hidden_button.clicked.connect(self._show_hidden_anyway)
+        hidden_row.addWidget(self.show_hidden_button)
+        layout.addLayout(hidden_row)
 
         self.results_table = QTableWidget(0, len(RESULT_COLUMNS))
         self.results_table.setHorizontalHeaderLabels(RESULT_COLUMNS)
@@ -3533,7 +3860,10 @@ class MainWindow(QMainWindow):
             R_UPDATED, Qt.SortOrder.DescendingOrder)
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setMinimumHeight(180)
-        self.results_table.horizontalHeader().setStretchLastSection(True)
+        # No stretch-last-section (v0.1.6 T11): it handed every
+        # spare pixel to Score, the column that needs it least.
+        # _fit_results_columns hands the space to Description.
+        self.results_table.horizontalHeader().setStretchLastSection(False)
         self.results_table.horizontalHeader().sortIndicatorChanged.connect(
             self._results_sorted)
         self.results_table.doubleClicked.connect(self._open_result)
@@ -3551,22 +3881,26 @@ class MainWindow(QMainWindow):
         detail_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
         layout.addWidget(self.results_table, stretch=1)
 
-        detail_box = QGroupBox("Details")
-        detail_box.setStyleSheet(
-            "QGroupBox { margin-top: 4px; padding-top: 4px; }")
-        detail_layout = QVBoxLayout(detail_box)
-        detail_layout.setContentsMargins(6, 2, 6, 4)
+        # The Details pane (v0.1.6 T16): a plain label beside the
+        # view, not a group box. The group box's squeezed title
+        # overlapped its own border at both window sizes, and its
+        # chrome cost height the results table needs. The view
+        # keeps a smaller share than the old 80 px for the same
+        # reason.
+        detail_row = QHBoxLayout()
+        detail_label = QLabel("Details")
+        detail_label.setStyleSheet("font-weight: bold;")
+        detail_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        detail_row.addWidget(detail_label)
         self.detail_view = QTextBrowser()
         # Links in the pane open in the browser (T49), in the
         # theme's light blue so they read on the dark surface.
         self.detail_view.setOpenExternalLinks(True)
         self.detail_view.document().setDefaultStyleSheet(
             "a { color: #7ee0ff; }")
-        # A smaller share (T31): the pane used to take 140 px and
-        # push the Add buttons below the fold at 1100x700.
-        self.detail_view.setMaximumHeight(80)
-        detail_layout.addWidget(self.detail_view)
-        layout.addWidget(detail_box)
+        self.detail_view.setMaximumHeight(44)
+        detail_row.addWidget(self.detail_view, stretch=1)
+        layout.addLayout(detail_row)
         self._show_result_detail()
 
         add_row = QHBoxLayout()
@@ -3592,30 +3926,34 @@ class MainWindow(QMainWindow):
         self.stop_stella_button.setEnabled(False)
         self.stop_stella_button.clicked.connect(self.stop_stella_check)
         add_row.addWidget(self.stop_stella_button)
-        add_row.addStretch(1)
-        layout.addLayout(add_row)
-
-        more_row = QHBoxLayout()
+        # Load more and the hand-add button share this row
+        # (v0.1.6 T16): they used to take a row each, and the
+        # results table paid for both.
         self.load_more_button = QPushButton("Load more results")
         self.load_more_button.setToolTip(
             "Fetch the next page of results and add them below.")
         self.load_more_button.setEnabled(False)
         self.load_more_button.clicked.connect(self.load_more_results)
-        more_row.addWidget(self.load_more_button)
-        more_row.addStretch(1)
-        layout.addLayout(more_row)
+        add_row.addWidget(self.load_more_button)
+        add_row.addStretch(1)
+        layout.addLayout(add_row)
 
-        sites_box = QGroupBox("Search on other websites")
-        sites_layout = QVBoxLayout(sites_box)
-        sites_layout.addWidget(QLabel(
+        # The other-websites buttons on one row (v0.1.6 T16): the
+        # group box and its explainer took about 90 px for what is
+        # a label and a row of buttons. The buttons' own tooltips
+        # still say they open the search in the browser, and the
+        # label's tooltip keeps the Sources pointer.
+        sites_row = QHBoxLayout()
+        sites_label = QLabel("Search on other websites:")
+        sites_label.setToolTip(
             "These open the same search in your browser. "
-            "Add or remove websites in the Sources tab."
-        ))
+            "Add or remove websites in the Sources tab.")
+        sites_row.addWidget(sites_label)
         # A wrapping flow layout (T51, 012): 12 sites measured
         # 1,413 px of buttons in a row; now they wrap instead.
         self.site_buttons_row = FlowLayout()
-        sites_layout.addLayout(self.site_buttons_row)
-        layout.addWidget(sites_box)
+        sites_row.addLayout(self.site_buttons_row, stretch=1)
+        layout.addLayout(sites_row)
 
         # The hand-add form lives in its own window now (T22): the
         # Search tab stays about searching.
@@ -3628,7 +3966,9 @@ class MainWindow(QMainWindow):
         self.found_add_button.setToolTip(
             "Add a link you found yourself to My List.")
         self.found_add_button.clicked.connect(self.show_add_link_dialog)
-        layout.addWidget(self.found_add_button)
+        # In the action row, before its stretch (v0.1.6 T16).
+        add_row.insertWidget(add_row.count() - 1,
+                             self.found_add_button)
 
         scroll.setWidget(inner)
         tab_layout.addWidget(scroll)
@@ -3883,6 +4223,120 @@ class MainWindow(QMainWindow):
             return
         self.results_empty_label.setVisible(False)
 
+    def _filter_breakdown(self, results: list[dict]) -> dict:
+        """How many results each active filter hid (v0.1.6 T23).
+
+        Counted in the same order core.filter_results applies
+        them (stars, then license, then Active only), so the
+        counts add up to the hidden total and the biggest one
+        is the filter doing the hiding."""
+        min_stars = int(self.stars_combo.currentText())
+        wanted = (self.license_combo.currentData() or "").strip().lower()
+        months = core.ACTIVE_WINDOWS[self.window_combo.currentText()]
+        after_stars = [
+            item for item in results
+            if isinstance(item, dict)
+            and core._safe_int(item.get("stars")) >= min_stars]
+        if wanted:
+            after_license = [
+                item for item in after_stars
+                if str(item.get("license") or "").strip().lower()
+                == wanted]
+        else:
+            after_license = after_stars
+        if self.active_check.isChecked():
+            after_active = [
+                item for item in after_license
+                if core.is_active(item.get("updated"), months)]
+        else:
+            after_active = after_license
+        return {
+            "stars": len(results) - len(after_stars),
+            "license": len(after_stars) - len(after_license),
+            "active": len(after_license) - len(after_active),
+        }
+
+    def _update_filter_hidden_ui(self, hidden: int):
+        """Name the filter that hid results, and offer the way
+        back (v0.1.6 T23). Hidden when nothing was hidden."""
+        if hidden <= 0 or not hasattr(self, "filter_hidden_label"):
+            if hasattr(self, "filter_hidden_label"):
+                self.filter_hidden_label.setVisible(False)
+                self.show_hidden_button.setVisible(False)
+            return
+        breakdown = self._hidden_breakdown
+        dominant = max(
+            ("active", "stars", "license"),
+            key=lambda name: breakdown.get(name, 0))
+        count = breakdown.get(dominant, 0)
+        if dominant == "active" and count:
+            why = (f"Active only (updated in the last "
+                   f"{self.window_combo.currentText()}) hid "
+                   f"{count} of them.")
+        elif dominant == "stars" and count:
+            why = (f"The stars filter (at least "
+                   f"{self.stars_combo.currentText()} stars or "
+                   f"likes) hid {count} of them.")
+        elif dominant == "license" and count:
+            why = f"The license filter hid {count} of them."
+        else:
+            why = "The filters above hid them."
+        word = "result" if hidden == 1 else "results"
+        self.filter_hidden_label.setText(
+            f"{hidden} {word} hidden by filters. {why}")
+        self.filter_hidden_label.setVisible(True)
+        self.show_hidden_button.setVisible(True)
+
+    def _show_hidden_anyway(self):
+        """Relax the hiding filter for this search (v0.1.6 T23).
+
+        One click, this search only: the control changes with
+        its signals blocked, so the saved choice (and the
+        Active-only default) is exactly as it was, and the next
+        launch starts from the saved filters again."""
+        breakdown = self._hidden_breakdown
+        dominant = max(
+            ("active", "stars", "license"),
+            key=lambda name: breakdown.get(name, 0))
+        if breakdown.get(dominant, 0) <= 0:
+            dominant = "active"
+        if dominant == "active":
+            self.active_check.blockSignals(True)
+            self.active_check.setChecked(False)
+            self.active_check.blockSignals(False)
+            note = "Active only is off for this search."
+        elif dominant == "stars":
+            self.stars_combo.blockSignals(True)
+            self.stars_combo.setCurrentText("0")
+            self.stars_combo.blockSignals(False)
+            note = "The stars filter is off for this search."
+        else:
+            self.license_combo.blockSignals(True)
+            self.license_combo.setCurrentIndex(0)
+            self.license_combo.blockSignals(False)
+            note = "The license filter is off for this search."
+        raw = self._last_raw_results
+        months = core.ACTIVE_WINDOWS[self.window_combo.currentText()]
+        filtered = core.filter_results(
+            raw,
+            active_only=self.active_check.isChecked(),
+            months=months,
+            min_stars=int(self.stars_combo.currentText()),
+            license_filter=self.license_combo.currentData() or "",
+        )
+        filtered.sort(key=core.updated_sort_key, reverse=True)
+        self.results = filtered
+        self._hidden_breakdown = self._filter_breakdown(raw)
+        hidden = len(raw) - len(filtered)
+        self._show_results()
+        self._update_filter_hidden_ui(hidden)
+        count = len(filtered)
+        word = "result" if count == 1 else "results"
+        self.statusBar().showMessage(
+            f"Showing {count} {word}. {note}")
+        core.log("Search filters relaxed for this search: "
+                 f"{note}")
+
     def _search_done(self, results: list[dict],
                      failures: list | None = None, cached: bool = False):
         self.search_button.setEnabled(True)
@@ -3926,6 +4380,9 @@ class MainWindow(QMainWindow):
         count = len(self.results)
         self.load_more_button.setEnabled(count > 0)
         hidden = total_before - count
+        self._last_raw_results = list(results)
+        self._hidden_breakdown = self._filter_breakdown(results)
+        self._update_filter_hidden_ui(hidden)
         word = "result" if count == 1 else "results"
         message = f"Found {count} {word}"
         if hidden:
@@ -4026,6 +4483,7 @@ class MainWindow(QMainWindow):
             min_stars=min_stars,
             license_filter=license_filter,
         )
+        self._last_raw_results.extend(results)
         seen = {core.normalize_url(item.get("url") or "")
                 for item in self.results}
         new = [item for item in filtered
@@ -4082,10 +4540,16 @@ class MainWindow(QMainWindow):
         table = self.results_table
         table.setSortingEnabled(False)
         table.setRowCount(len(self.results))
+        saved_keys = self._saved_url_keys()
         for row, item in enumerate(self.results):
             downloads = core._safe_int(item.get("downloads"))
+            # Already saved rows say so (v0.1.6 T37): the add
+            # itself still dedupes silently, as before.
+            title_text = item.get("title", "")
+            if core.normalize_url(item.get("url") or "") in saved_keys:
+                title_text = f"{title_text} (In My List)"
             table.setItem(row, R_TITLE,
-                          _cell(item.get("title", ""), row_index=row))
+                          _cell(title_text, row_index=row))
             table.setItem(row, R_SOURCE, _cell(item.get("source", "")))
             table.setItem(row, R_STARS,
                           _cell(str(item.get("stars", 0)),
@@ -4147,24 +4611,86 @@ class MainWindow(QMainWindow):
         self._apply_results_filter()
 
     def _fit_results_columns(self):
-        """Shrink Description, then Title, until every column fits
-        the table's width (T31): STELLA and Score stay visible
-        without scrolling at the default size. Each keeps a floor
-        of 140 px, so the text stays readable."""
+        """Fit every column inside the table's width (T31, and
+        v0.1.6 T10/T11).
+
+        The fit recomputes from content widths every time, so a
+        fit run against provisional geometry (before the window
+        is shown) never strands a column at a shrink floor: the
+        show and tab-switch refits land on the same widths a live
+        search produces. Score is capped near its content width
+        ("100 Worth a look" plus padding); what is left after the
+        fixed columns and Score is split between Title and
+        Description, Description taking the larger share (T11:
+        the space Score used to waste goes to the reading
+        columns). At the default 1100x700 the table fits its
+        viewport with no horizontal scrollbar and no clipped
+        header, and the 1366x768 fit stays exact."""
         table = self.results_table
         available = table.viewport().width() or table.width()
         if available < 400:
-            return  # not laid out yet; the caps above still apply
-        total = sum(table.columnWidth(col)
-                    for col in range(len(RESULT_COLUMNS)))
-        over = total - available
-        for col, floor in ((R_DESC, 140), (R_TITLE, 140)):
-            if over <= 0:
-                break
-            give = min(over, table.columnWidth(col) - floor)
-            if give > 0:
-                table.setColumnWidth(col, table.columnWidth(col) - give)
-                over -= give
+            return  # not laid out yet; the caps in _show_results apply
+        table.resizeColumnsToContents()
+        if table.columnWidth(R_TITLE) > 260:
+            table.setColumnWidth(R_TITLE, 260)
+        if table.columnWidth(R_DESC) > 300:
+            table.setColumnWidth(R_DESC, 300)
+        if table.columnWidth(R_SCORE) > SCORE_COLUMN_MAX:
+            table.setColumnWidth(R_SCORE, SCORE_COLUMN_MAX)
+        fixed = sum(table.columnWidth(col)
+                    for col in range(len(RESULT_COLUMNS))
+                    if col not in (R_TITLE, R_DESC))
+        budget = available - fixed
+        if budget < 200:
+            # Very narrow: Score gives up its padding too, and
+            # Title and Description keep readable floors; below
+            # this the table scrolls, as it always has at tiny
+            # widths.
+            if table.columnWidth(R_SCORE) > 104:
+                table.setColumnWidth(R_SCORE, 104)
+                budget = available - sum(
+                    table.columnWidth(col)
+                    for col in range(len(RESULT_COLUMNS))
+                    if col not in (R_TITLE, R_DESC))
+        title = min(260, max(84, int(budget * 0.42)))
+        desc = budget - title
+        if desc > 560 and title < 260:
+            # A very wide window: Description stops growing at a
+            # readable measure and Title takes the rest, up to
+            # its cap; anything beyond that stays with
+            # Description rather than Score.
+            move = min(260 - title, desc - 560)
+            title += move
+            desc -= move
+        table.setColumnWidth(R_TITLE, title)
+        table.setColumnWidth(R_DESC, max(60, desc))
+
+    def _saved_url_keys(self) -> set:
+        """The normalised links already in My List (T37)."""
+        return {core.normalize_url(item.get("url") or "")
+                for item in self.my_list}
+
+    def _refresh_result_markers(self):
+        """Refresh the In My List markers in place (v0.1.6 T37):
+        called whenever My List changes, so a row saved or
+        removed updates its marker without a new search."""
+        if not hasattr(self, "results_table"):
+            return
+        saved_keys = self._saved_url_keys()
+        for row in range(self.results_table.rowCount()):
+            cell = self.results_table.item(row, R_TITLE)
+            if cell is None:
+                continue
+            stored = cell.data(ROW_ROLE)
+            if not isinstance(stored, int) \
+                    or not 0 <= stored < len(self.results):
+                continue
+            item = self.results[stored]
+            title_text = item.get("title", "")
+            if core.normalize_url(item.get("url") or "") in saved_keys:
+                title_text = f"{title_text} (In My List)"
+            if cell.text() != title_text:
+                cell.setText(title_text)
 
     def _selected_results(self) -> list[dict]:
         # Visual rows are not list indexes once the user sorts, so
@@ -4363,6 +4889,7 @@ class MainWindow(QMainWindow):
         self._save_list()
         self._refresh_list_tab()
         if added:
+            core.log(f"Added {added} to My List.")
             self.statusBar().showMessage(f"Added {added} to My List.")
         else:
             # Same honest line as Add all (T37): "Added 0"
@@ -4382,6 +4909,7 @@ class MainWindow(QMainWindow):
         self._save_list()
         self._refresh_list_tab()
         if added:
+            core.log(f"Added {added} to My List.")
             self.statusBar().showMessage(f"Added {added} to My List.")
         else:
             # "Added 0" reports success for doing nothing (T37).
@@ -4414,9 +4942,16 @@ class MainWindow(QMainWindow):
         description, files, sizes, and license, on demand."""
         chosen = self._selected_results()
         if not chosen:
+            # The resting text also carries the two explainer
+            # lines folded in from the tab (v0.1.6 T16).
             self.detail_view.setPlainText(
                 "Click a row to see its full description, files, "
-                "and license here.")
+                "and license here. Searches GitHub and Hugging "
+                "Face live, newest first; recent searches are kept "
+                "in the search box drop-down. Active only keeps "
+                "results updated recently. Stars counts GitHub "
+                "stars and Hugging Face likes. A license filter "
+                "hides results with no license shown.")
             return
         item = chosen[0]
         lines = [item.get("title") or "", "",
@@ -4498,6 +5033,7 @@ class MainWindow(QMainWindow):
         self._save_list()
         self._refresh_list_tab()
         if added:
+            core.log(f"Added a link to My List: {item['title']}")
             self.found_url.clear()
             self.found_title.clear()
             self.found_note.clear()
@@ -4615,7 +5151,10 @@ class MainWindow(QMainWindow):
         self.list_table.setSortingEnabled(True)
         self.list_table.horizontalHeader().setSortIndicator(
             -1, Qt.SortOrder.AscendingOrder)
-        self.list_table.horizontalHeader().setStretchLastSection(True)
+        # No stretch-last-section (v0.1.6 T11): it handed every
+        # spare pixel to Score. _fit_list_columns hands the space
+        # to Title instead.
+        self.list_table.horizontalHeader().setStretchLastSection(False)
         self.list_table.horizontalHeader().sortIndicatorChanged.connect(
             self._list_sorted)
         self.list_table.doubleClicked.connect(self._open_list_item)
@@ -4708,6 +5247,12 @@ class MainWindow(QMainWindow):
         self.download_button = QPushButton("Download and convert")
         self.download_button.setToolTip(
             "Download the picked datasets and convert them for STELLA.")
+        # The primary action of its section (v0.1.6 T30): the
+        # gold fill the theme uses for the active choice, so it
+        # stands out from the same-weight buttons around it.
+        self.download_button.setStyleSheet(
+            "background-color: #ffd166; color: #16233d; "
+            "font-weight: bold; border-color: #ffd166;")
         self.download_button.clicked.connect(self.start_download)
         action_row.addWidget(self.download_button)
         self.add_to_queue_button = QPushButton("Add selected to queue")
@@ -4722,7 +5267,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.queue_button)
         action_row.addStretch(1)
         self.edit_section = CollapsibleSection(
-            "Edit and convert", key="list-edit")
+            "Edit and convert", key="list-edit", default_expanded=False)
         self.edit_section.set_content_layout(action_row)
         layout.addWidget(self.edit_section)
 
@@ -4756,9 +5301,16 @@ class MainWindow(QMainWindow):
             "Write the STELLA manifest into the STELLA folder on this PC.")
         self.send_button.clicked.connect(self.send_to_stella)
         export_row.addWidget(self.send_button)
+        self.open_converted_button = QPushButton(
+            "Open the converted folder")
+        self.open_converted_button.setToolTip(
+            "Open the folder with the converted .jsonl files.")
+        self.open_converted_button.clicked.connect(
+            self.open_converted_folder)
+        export_row.addWidget(self.open_converted_button)
         export_row.addStretch(1)
         self.export_section = CollapsibleSection(
-            "Export", key="list-export")
+            "Export", key="list-export", default_expanded=False)
         self.export_section.set_content_layout(export_row)
         layout.addWidget(self.export_section)
         layout.addWidget(_explain(
@@ -5078,14 +5630,65 @@ class MainWindow(QMainWindow):
             table.setColumnWidth(L_TITLE, 320)
         if table.columnWidth(L_NOTES) > 200:
             table.setColumnWidth(L_NOTES, 200)
+        self._fit_list_columns()
         self.tabs.setTabText(
             self.list_tab_index, f"My List ({len(self.my_list)})"
         )
         self.list_empty_label.setVisible(len(self.my_list) == 0)
+        self._refresh_result_markers()
         self._refresh_dead_button()
         self._apply_list_filter()
         self._refresh_stats()
         self._refresh_checklist()
+        self._sync_undo_actions()
+
+    def _fit_list_columns(self):
+        """Fit the My List columns inside the table's width
+        (v0.1.6 T11): Score is capped near its content width,
+        overflow comes out of Notes, then Link, then Title, and
+        spare width goes to Title first (up to its 320 px cap),
+        then Link and Notes (their existing caps), so the freed
+        Score space lands on the column that truncates dataset
+        names today."""
+        table = self.list_table
+        available = table.viewport().width() or table.width()
+        if available < 400:
+            return  # not laid out yet; the caps above still apply
+        # Recompute from content, like the results fit (T10/T11):
+        # a fit against provisional geometry must not strand a
+        # column at a shrink floor once the window is shown.
+        table.resizeColumnsToContents()
+        if table.columnWidth(L_LINK) > 320:
+            table.setColumnWidth(L_LINK, 320)
+        if table.columnWidth(L_TITLE) > 320:
+            table.setColumnWidth(L_TITLE, 320)
+        if table.columnWidth(L_NOTES) > 200:
+            table.setColumnWidth(L_NOTES, 200)
+        if table.columnWidth(L_SCORE) > SCORE_COLUMN_MAX:
+            table.setColumnWidth(L_SCORE, SCORE_COLUMN_MAX)
+        total = sum(table.columnWidth(col)
+                    for col in range(len(LIST_COLUMNS)))
+        over = total - available
+        for col, floor in ((L_NOTES, 80), (L_LINK, 180),
+                           (L_TITLE, 150), (L_NOTES, 56),
+                           (L_LINK, 140), (L_TITLE, 110)):
+            if over <= 0:
+                break
+            give = min(over, table.columnWidth(col) - floor)
+            if give > 0:
+                table.setColumnWidth(col, table.columnWidth(col) - give)
+                over -= give
+        if over < 0:
+            slack = -over
+            for col, cap in ((L_TITLE, 320), (L_LINK, 320),
+                             (L_NOTES, 200)):
+                if slack <= 0:
+                    break
+                give = min(slack, cap - table.columnWidth(col))
+                if give > 0:
+                    table.setColumnWidth(
+                        col, table.columnWidth(col) + give)
+                    slack -= give
 
     def _refresh_dead_button(self):
         """Enable "Remove the dead ones" only when the check has
@@ -5206,6 +5809,18 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(
                 "There are no converted files for that link yet.")
+
+    def open_converted_folder(self):
+        """Open the converted-files folder itself (v0.1.6 T39):
+        one button on My List, instead of depending on the
+        Download window still being open."""
+        folder = _download_dir()
+        if folder.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        else:
+            self.statusBar().showMessage(
+                "There is no converted folder yet. Download and "
+                "convert a dataset first.")
 
     def _copy_selected_link(self):
         rows = self._selected_list_rows()
@@ -5347,6 +5962,7 @@ class MainWindow(QMainWindow):
             self._edit_undo_stack.append(
                 (before, core.normalize_url(item.get("url") or "")))
             self.undo_edit_button.setEnabled(True)
+            core.log(f"Edited a link in My List: {item.get('title')}")
         self._save_list()
         self._refresh_list_tab()
         self.statusBar().showMessage("Saved the changes.")
@@ -5359,6 +5975,9 @@ class MainWindow(QMainWindow):
                 "Wait for the check to finish first.")
             return
         if not self._edit_undo_stack:
+            # Invoked with nothing to undo (v0.1.6 T13): say so
+            # instead of staying silent.
+            self.statusBar().showMessage("Nothing to undo.")
             return
         before, after_url = self._edit_undo_stack.pop()
         self.undo_edit_button.setEnabled(bool(self._edit_undo_stack))
@@ -5406,6 +6025,7 @@ class MainWindow(QMainWindow):
                         if index not in keep]
         self._save_list()
         self._refresh_list_tab()
+        core.log(f"Removed {len(rows)} from My List.")
         self.statusBar().showMessage(f"Removed {len(rows)} from My List.")
 
     def undo_remove(self):
@@ -5415,6 +6035,9 @@ class MainWindow(QMainWindow):
                 "Wait for the check to finish first.")
             return
         if not self._undo_stack:
+            # Invoked with nothing to undo (v0.1.6 T13): say so
+            # instead of staying silent.
+            self.statusBar().showMessage("Nothing to undo.")
             return
         removed = self._undo_stack.pop()
         for row, item in sorted(removed):
@@ -5448,12 +6071,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Kept My List as it is ({count} {word}).")
             return
+        cleared = len(self.my_list)
         self._undo_stack.append(
             [(row, item) for row, item in enumerate(self.my_list)])
         self.undo_button.setEnabled(True)
         self.my_list = []
         self._save_list()
         self._refresh_list_tab()
+        core.log(f"Cleared My List: {cleared} removed.")
         self.statusBar().showMessage("My List is empty now.")
 
     def remove_dead(self):
@@ -5492,6 +6117,7 @@ class MainWindow(QMainWindow):
                         if index not in keep]
         self._save_list()
         self._refresh_list_tab()
+        core.log(f"Removed {len(rows)} dead {word} from My List.")
         self.statusBar().showMessage(
             f"Removed {len(rows)} dead {word} from My List.")
 
@@ -5684,15 +6310,37 @@ class MainWindow(QMainWindow):
                 "Nothing selected. Click a row first.")
             return
         items = [(row, self.my_list[row]) for row in rows]
-        out_dir = core.home_dir() / "stella-ready"
+        out_dir = _download_dir()
         self._clear_finished()
         dialog = DownloadDialog(items, out_dir, parent=self)
+        core.log(f"Download and convert started: {len(items)} "
+                 "dataset(s).")
         dialog.start()
         dialog.exec()
         self._save_list()
         self._refresh_list_tab()
-        self._mark_finished(
-            "Download and convert finished. See the folder for files.")
+        # The finish line matches what actually converted
+        # (v0.1.6 T6): the dialog has been honest since v0.1.4
+        # T16, and the main window must not contradict it the
+        # moment it closes. Zero converted gets the dialog's own
+        # honest result, with no checkmark and no folder promise;
+        # some converted names the count.
+        converted = dialog._done_ok
+        if converted == 0:
+            self._clear_finished()
+            self.statusBar().showMessage(
+                "Nothing converted. See the download window for why.")
+            core.log("Download and convert finished: nothing "
+                     "converted.")
+        else:
+            word = "dataset" if converted == 1 else "datasets"
+            self._mark_finished(
+                f"Download and convert finished: {converted} "
+                f"{word} converted, {dialog._done_rows} rows kept. "
+                "See the folder for files.")
+            core.log(f"Download and convert finished: {converted} "
+                     f"dataset(s) converted, {dialog._done_rows} "
+                     "rows kept.")
 
     # ------------------------------------------------------------ offline, watch, queue (T63, T66, T67)
 
@@ -5760,6 +6408,7 @@ class MainWindow(QMainWindow):
                 "That search is already watched.")
             return
         watch.save_watches(watches)
+        core.log(f"Watch created: {query!r} (category {category}).")
         self.statusBar().showMessage(
             f"Watching {query!r}. Scout will check for new datasets "
             "while the app is open.")
@@ -5828,14 +6477,31 @@ class MainWindow(QMainWindow):
             core.log(f"Watch {finished_watch.get('query')!r} could not "
                      "run: both sources failed.", level="WARNING")
             return
+        first_run = not stored.get("last_run")
         stored.update(finished_watch)
         watch.save_watches(watches)
-        if new_items:
+        # The run's outcome is logged (v0.1.6 T14), new or not.
+        core.log(f"Watch {finished_watch.get('query')!r} ran: "
+                 f"{len(new_items)} new dataset(s).")
+        # The outcome also lands in the main window (v0.1.6 T21),
+        # not only inside the watch dialog.
+        if first_run:
+            count = finished_watch.get("baseline_count")
+            if count is None:
+                count = len(finished_watch.get("last_seen") or [])
+            self.statusBar().showMessage(
+                f"Watch started: {count} results saved as the "
+                "starting point. New ones will show here.")
+        elif new_items:
             count = len(new_items)
             word = "dataset" if count == 1 else "datasets"
             self.statusBar().showMessage(
                 f"Watch {finished_watch.get('query')!r} found {count} "
                 f"new {word}. See Watched searches in the File menu.")
+        else:
+            self.statusBar().showMessage(
+                f"Watch {finished_watch.get('query')!r} ran: "
+                "nothing new.")
 
     def _on_watches_done(self):
         if self._watch_dialog is not None:
@@ -5859,6 +6525,7 @@ class MainWindow(QMainWindow):
         dlqueue.save_queue(entries)
         if added:
             word = "dataset" if added == 1 else "datasets"
+            core.log(f"Added {added} {word} to the download queue.")
             self.statusBar().showMessage(
                 f"Added {added} {word} to the download queue.")
         else:
@@ -5981,9 +6648,9 @@ class MainWindow(QMainWindow):
         self.sources_empty_label.setStyleSheet("color: #9fb0cc;")
         self.sources_empty_label.setWordWrap(True)
         layout.addWidget(self.sources_empty_label)
-        self.sources_table = QTableWidget(0, 3)
+        self.sources_table = QTableWidget(0, 4)
         self.sources_table.setHorizontalHeaderLabels(
-            ["Website", "Address", "Remove"])
+            ["Website", "Address", "Remove", "Edit"])
         self.sources_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         self.sources_table.setEditTriggers(
@@ -5996,7 +6663,18 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(
             2, QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.sources_table, stretch=1)
+        header.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents)
+        # Double-click a row to edit it (v0.1.6 T34).
+        self.sources_table.doubleClicked.connect(
+            self._source_double_clicked)
+        # No stretch (v0.1.6 T28): the table takes the height its
+        # rows need (refresh caps it), and the space it used to
+        # reserve goes to the rest of the tab.
+        layout.addWidget(self.sources_table)
+        layout.addStretch(1)
+        # The website being edited in the form, if any (T34).
+        self._editing_site = None
 
         add_box = QGroupBox("Add a website")
         add_layout = QFormLayout(add_box)
@@ -6061,6 +6739,16 @@ class MainWindow(QMainWindow):
             "Stored on this PC only. Without one, GitHub allows "
             "fewer searches per minute."
         ))
+        token_layout.addRow("", QLabel(
+            "New to tokens? You make one on GitHub: sign in there, "
+            "create a token on the token page, then paste it here."
+        ))
+        self.token_page_button = QPushButton("Open GitHub token page")
+        self.token_page_button.setToolTip(
+            "Open the GitHub token settings in your browser, where "
+            "you can make a token.")
+        self.token_page_button.clicked.connect(self._open_token_page)
+        token_layout.addRow("", self.token_page_button)
         self.token_save_button = QPushButton("Save token")
         self.token_save_button.setToolTip(
             "Save this token on this PC for more GitHub searches.")
@@ -6097,8 +6785,8 @@ class MainWindow(QMainWindow):
         return not error
 
     def _validate_site_url(self, force: bool = False) -> bool:
-        """On blur, beside the field. A bad-looking address warns
-        but still saves; only an empty address blocks the add."""
+        """On blur, beside the field. On add, a bad-looking or
+        empty address blocks the add (see add_source)."""
         text = self.site_url.text().strip()
         touched = force or self.site_url.isModified()
         error = ""
@@ -6151,6 +6839,13 @@ class MainWindow(QMainWindow):
                 # catch as a doubled Remove button.
                 old.hide()
                 old.deleteLater()
+        # The old Edit buttons go too, for the same reason.
+        for row in range(table.rowCount()):
+            old_edit = table.cellWidget(row, 3)
+            if old_edit is not None:
+                table.removeCellWidget(row, 3)
+                old_edit.hide()
+                old_edit.deleteLater()
         table.setRowCount(len(sites))
         for row, site in enumerate(sites):
             table.setItem(row, 0, QTableWidgetItem(site["name"]))
@@ -6162,26 +6857,100 @@ class MainWindow(QMainWindow):
                 lambda _checked=False, name=site["name"]: self.remove_source(name)
             )
             table.setCellWidget(row, 2, remove)
+            edit = QPushButton("Edit")
+            edit.setToolTip(
+                f"Load {site['name']} into the form below to fix it.")
+            edit.clicked.connect(
+                lambda _checked=False, name=site["name"]:
+                    self.edit_source(name)
+            )
+            table.setCellWidget(row, 3, edit)
         table.resizeColumnsToContents()
+        # Size the table to its rows (v0.1.6 T28): header plus one
+        # row height per website, with a sane maximum so a long
+        # list still scrolls inside the table.
+        row_height = table.rowHeight(0) if sites else 30
+        if row_height <= 0:
+            row_height = 30
+        header_height = table.horizontalHeader().height() or 30
+        wanted = header_height + row_height * max(1, len(sites)) + 8
+        table.setMaximumHeight(min(320, wanted))
         self.sources_empty_label.setVisible(len(sites) == 0)
+
+    def edit_source(self, name: str):
+        """Load a saved website into the form to fix it (T34).
+
+        The Add button becomes Save changes; saving goes through
+        the same validation as adding (T2), so a fixed address
+        that still does not look like a link is not saved."""
+        sites = core.load_sources()
+        for site in sites:
+            if site["name"] == name:
+                self._editing_site = name
+                self.site_name.setText(site["name"])
+                self.site_url.setText(site["url"])
+                self.site_name.setModified(False)
+                self.site_url.setModified(False)
+                self.site_add_button.setText("Save changes")
+                self.statusBar().showMessage(
+                    f"Editing {name}. Fix the name or address, "
+                    "then press Save changes.")
+                return
+
+    def _source_double_clicked(self, index):
+        """Double-click a websites row to edit it (T34)."""
+        row = index.row()
+        cell = self.sources_table.item(row, 0)
+        if cell is not None:
+            self.edit_source(cell.text())
+
+    def _open_token_page(self):
+        """Open the GitHub token settings in the browser (T35)."""
+        QDesktopServices.openUrl(
+            QUrl("https://github.com/settings/tokens"))
+        self.statusBar().showMessage(
+            "Opened the GitHub token page in your browser.")
 
     def add_source(self):
         name = self.site_name.text().strip()
         url = self.site_url.text().strip()
         self._validate_site_name(force=True)
-        self._validate_site_url(force=True)
+        url_ok = self._validate_site_url(force=True)
         if not name or not url:
             self.statusBar().showMessage(
                 "Give the website a name and an address first."
             )
             return
+        if not url_ok:
+            # A bad-looking address is not added (v0.1.6 T2): the
+            # validator used to be called and its result thrown
+            # away, so a junk address was saved and given a Search
+            # button. Keep the form as typed so it can be fixed,
+            # and show the same inline message the Add a link
+            # dialog shows for the same input.
+            self.site_url_error.setText(
+                "That does not look like a link. Check it.")
+            self.site_url_error.setVisible(True)
+            return
         sites = core.load_sources()
-        sites.append({"name": name, "url": url})
+        editing = getattr(self, "_editing_site", None)
+        replaced = False
+        if editing:
+            for site in sites:
+                if site["name"] == editing:
+                    site["name"] = name
+                    site["url"] = url
+                    replaced = True
+                    break
+        if not replaced:
+            sites.append({"name": name, "url": url})
         if not self._try_save(
                 lambda: core.save_sources(sites),
                 "Could not save the websites",
                 "Could not save the websites. Try again."):
             return
+        self._editing_site = None
+        self.site_add_button.setText("Add website")
         self.site_name.clear()
         self.site_url.clear()
         # The cleared form is a fresh form (v0.1.4 T8): clear()
@@ -6197,7 +6966,12 @@ class MainWindow(QMainWindow):
         self.site_url_error.setVisible(False)
         self._refresh_sources_table()
         self._refresh_site_buttons()
-        self.statusBar().showMessage(f"Added {name}.")
+        if replaced:
+            core.log(f"Edited website {name}.")
+            self.statusBar().showMessage(f"Saved {name}.")
+        else:
+            core.log(f"Added website {name}.")
+            self.statusBar().showMessage(f"Added {name}.")
 
     def remove_source(self, name: str):
         sites = core.load_sources()
@@ -6226,6 +7000,7 @@ class MainWindow(QMainWindow):
         self.undo_site_button.setEnabled(True)
         self._refresh_sources_table()
         self._refresh_site_buttons()
+        core.log(f"Removed website {name}.")
         self.statusBar().showMessage(f"Removed {name}.")
 
     def undo_remove_source(self):
@@ -6286,6 +7061,10 @@ class MainWindow(QMainWindow):
                 "Could not save the token",
                 "Could not save the token. Try again."):
             return
+        # The save is logged, never the token (v0.1.6 T14): the
+        # log scrubbing would catch the value anyway, and the
+        # line does not contain it in the first place.
+        core.log("GitHub token saved.")
         error = self.token_error.text().strip()
         if not valid and error:
             lowered = error[0].lower() + error[1:]
@@ -6317,6 +7096,10 @@ def main() -> int:
         # second try takes a stale lock over cleanly.
         if not guard.try_take():
             return 0
+    # Orphaned download work folders (v0.1.6 T9): only the owning
+    # instance cleans, and only at startup, so a live download's
+    # own work folder is never touched.
+    download.cleanup_orphan_tmp_folders()
     window = MainWindow()
     guard.start_server(window.bring_to_front)
     window.show()
